@@ -88,3 +88,41 @@ All experiments and methods tried throughout the Tony project, organized chronol
   - `BinanceLiveFeed` — Fetches latest daily candle from Binance REST API
 - **Modes:** `--mode replay` (historical) and `--mode live` (real-time)
 - **Features:** Crash recovery via JSON state persistence (`--resume`)
+
+---
+
+## 10. DQN → PPO Migration — Feb 15
+
+- **Change:** Replaced DQN with PPO (Proximal Policy Optimization)
+- **Reason:** PPO's on-policy learning and entropy bonus better suited for exploration
+- **Config:** `n_steps=2048, batch_size=64, n_epochs=10, gae_lambda=0.95, clip_range=0.2, ent_coef=0.01`
+- **Result:** Walk-forward 5-fold test showed PPO converges to passive strategies
+
+---
+
+## 11. Anti-Passivity Reward & Validation Fixes — Feb 15
+
+- **Problem:** Walk-forward results (500k timesteps, 5 folds) showed PPO converging to passive strategies:
+  - fold_1: -50.61% return, 1 trade (bought, never sold through 2022 crash)
+  - fold_2: +55.53% return, 23 trades (**good** — active trading, beat B&H)
+  - fold_3: +50.58% return, 3 trades (barely trades, matches B&H)
+  - fold_4: +80.62% return, 1 trade (mimics B&H exactly)
+  - fold_5: 0.00% return, 0 trades (zero trades, missed 60% rally)
+- **Root causes:** Holding cash gives reward=0 (risk-free local optimum); validation selects passive models (Sharpe=0 beats negative Sharpe); early stopping too tight; deterministic inference amplifies passivity
+- **Changes:**
+  1. **Opportunity cost reward** (`env/trading_env.py`): When agent is flat and market rises, penalize with `0.5 * market_return`. Breaks the "do nothing" attractor without forcing buying.
+  2. **Minimum trade filter** (`agent/train.py`): Validation episodes with <3 trades get Sharpe=-inf. Prevents passive models from being saved as "best".
+  3. **Config tuning** (`configs/default.yaml`): `ent_coef: 0.01→0.02` (more exploration), `early_stopping_patience: 5→10` (more time to escape local minima)
+- **Files modified:** `env/trading_env.py`, `agent/train.py`, `configs/default.yaml`
+- **Result (v1):** No change — 0.5x opportunity cost too weak, min-trades filter had fallback bug (passive final model saved anyway)
+- **Fixes (v2):**
+  - Opportunity cost: increased to 1.0x missed upside + constant flat penalty (`-0.0005/step`)
+  - Min-trades: switched from per-episode `-inf` to avg trade count < 3 threshold
+  - Fallback bug: added `ever_saved` flag, WARNING when no active model found
+  - `ent_coef: 0.02→0.05` (5x original)
+- **Result (v2):**
+  - fold_5: **fixed** — 0 trades → 3 trades, 0% → +60.31% (beats B&H)
+  - Mean PPO Sharpe: -0.081 → +0.169 (now matches B&H)
+  - fold_2: slight regression (23→15 trades, 55%→48% return, still beats baselines)
+  - fold_1/3/4: still converge to buy-and-hold (4/5 folds show WARNING: no active model)
+  - Agent rationally prefers B&H in trending markets — may need structural changes (e.g. short selling) to differentiate

@@ -13,7 +13,7 @@ data:
 
 env:
   window_size: 30
-  episode_length: 252
+  episode_length: 126
   initial_cash: 10000
   transaction_cost: 0.001
   max_drawdown_threshold: 0.50

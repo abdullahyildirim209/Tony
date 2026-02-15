@@ -121,11 +121,10 @@ class ValidationCallback(BaseCallback):
         self.logger.record("val/win_rate", avg_metrics["win_rate"])
 
         if self.verbose:
-            ep_sharpes = [m["sharpe_ratio"] for m in all_metrics]
             print(
                 f"  [Val @ {self.num_timesteps}] "
                 f"{self.n_val_episodes} episodes  "
-                f"Sharpe={avg_metrics['sharpe_ratio']:.3f} ({', '.join(f'{s:.2f}' for s in ep_sharpes)})  "
+                f"Sharpe={avg_metrics['sharpe_ratio']:.3f}  "
                 f"Return={avg_metrics['cumulative_return']:.3%}  "
                 f"DD={avg_metrics['max_drawdown']:.3%}  "
                 f"Trades={avg_metrics['trade_count']:.0f}  "
@@ -217,8 +216,8 @@ def train(config_path: str = "configs/default.yaml"):
 
     best_path = os.path.join(train_cfg["model_save_dir"], train_cfg["best_model_name"])
     if not os.path.exists(best_path + ".zip"):
-        # Save final model if no best was saved
         model.save(best_path)
+        print("  WARNING: No best model saved during validation. Saving final model as fallback.")
 
     print(f"Training complete. Best model: {best_path}.zip")
     return best_path

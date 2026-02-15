@@ -125,6 +125,7 @@ def train_fold(config: dict, train_data: dict, val_data: dict, save_dir: str, to
     best_path = os.path.join(save_dir, "best_model")
     if not os.path.exists(best_path + ".zip"):
         model.save(best_path)
+        print("  WARNING: No best model saved during validation. Saving final model as fallback.")
 
     return best_path
 
