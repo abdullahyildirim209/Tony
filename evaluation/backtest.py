@@ -27,6 +27,8 @@ def make_env(data_path: str, config: dict) -> TradingEnv:
         pct_changes=data["pct_changes"],
         sma_ratios=data["sma_ratios"],
         rsi_norm=data["rsi_norm"],
+        fng_norm=data["fng_norm"] if "fng_norm" in data else None,
+        buy_pressure=data["buy_pressure"] if "buy_pressure" in data else None,
         window_size=env_cfg["window_size"],
         episode_length=env_cfg["episode_length"],
         initial_cash=env_cfg["initial_cash"],

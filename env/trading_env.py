@@ -1,5 +1,7 @@
 """Custom Gymnasium trading environment for single-asset DQN trading."""
 
+from typing import Optional
+
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
@@ -8,13 +10,15 @@ from gymnasium import spaces
 class TradingEnv(gym.Env):
     """Single-asset trading environment with discrete Buy/Hold/Sell actions.
 
-    Observation space (35,):
+    Observation space (37,):
         [0:30]  - Last 30 daily pct changes
         [30]    - SMA ratio (sma_short / sma_long)
         [31]    - RSI normalized (0-1)
-        [32]    - Position one-hot: flat
-        [33]    - Position one-hot: long
-        [34]    - Unrealized PnL % (0 if flat)
+        [32]    - FNG normalized (0-1)
+        [33]    - Buy pressure (taker_buy_volume / volume, 0-1)
+        [34]    - Position one-hot: flat
+        [35]    - Position one-hot: long
+        [36]    - Unrealized PnL % (0 if flat)
 
     Action space: Discrete(3) — 0=Buy, 1=Hold, 2=Sell
     """
@@ -27,6 +31,8 @@ class TradingEnv(gym.Env):
         pct_changes: np.ndarray,
         sma_ratios: np.ndarray,
         rsi_norm: np.ndarray,
+        fng_norm: Optional[np.ndarray] = None,
+        buy_pressure: Optional[np.ndarray] = None,
         window_size: int = 30,
         episode_length: int = 252,
         initial_cash: float = 10000.0,
@@ -40,6 +46,9 @@ class TradingEnv(gym.Env):
         self.pct_changes = pct_changes.astype(np.float32)
         self.sma_ratios = sma_ratios.astype(np.float32)
         self.rsi_norm = rsi_norm.astype(np.float32)
+        n = len(close_prices)
+        self.fng_norm = fng_norm.astype(np.float32) if fng_norm is not None else np.full(n, 0.5, dtype=np.float32)
+        self.buy_pressure = buy_pressure.astype(np.float32) if buy_pressure is not None else np.full(n, 0.5, dtype=np.float32)
 
         self.window_size = window_size
         self.episode_length = episode_length
@@ -49,7 +58,7 @@ class TradingEnv(gym.Env):
         self.mode = mode
 
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(35,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(37,), dtype=np.float32
         )
         self.action_space = spaces.Discrete(3)
 
@@ -83,6 +92,8 @@ class TradingEnv(gym.Env):
 
         sma_ratio = self.sma_ratios[idx]
         rsi = self.rsi_norm[idx]
+        fng = self.fng_norm[idx]
+        bp = self.buy_pressure[idx]
 
         # Position encoding
         is_long = self.shares > 0
@@ -97,7 +108,7 @@ class TradingEnv(gym.Env):
 
         obs = np.concatenate([
             pct_window,
-            [sma_ratio, rsi, flat, long, unrealized_pnl],
+            [sma_ratio, rsi, fng, bp, flat, long, unrealized_pnl],
         ]).astype(np.float32)
 
         return obs
@@ -232,6 +243,8 @@ class TradingEnv(gym.Env):
 
         sma_ratio = self.sma_ratios[idx]
         rsi = self.rsi_norm[idx]
+        fng = self.fng_norm[idx]
+        bp = self.buy_pressure[idx]
         is_long = self.shares > 0
         flat = 1.0 if not is_long else 0.0
         long = 1.0 if is_long else 0.0
@@ -243,7 +256,7 @@ class TradingEnv(gym.Env):
 
         return np.concatenate([
             pct_window,
-            [sma_ratio, rsi, flat, long, unrealized_pnl],
+            [sma_ratio, rsi, fng, bp, flat, long, unrealized_pnl],
         ]).astype(np.float32)
 
     def get_episode_metrics(self) -> dict:

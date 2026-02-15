@@ -5,6 +5,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import requests
 import yaml
 import yfinance as yf
 
@@ -22,6 +23,7 @@ def fetch_ohlcv(ticker: str, start: str, end: str) -> pd.DataFrame:
         df.columns = df.columns.get_level_values(0)
     df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
     df.columns = ["open", "high", "low", "close", "volume"]
+    df["taker_buy_volume"] = df["volume"] * 0.5  # neutral fallback (yfinance lacks this)
     df.index.name = "date"
     return df
 
@@ -31,6 +33,55 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.ffill()
     df = df.dropna()
     return df
+
+
+def fetch_fng(start_date: str, end_date: str, cache_path: str = "data/fng_cache.csv") -> pd.Series:
+    """Fetch Crypto Fear & Greed Index from alternative.me API.
+
+    Returns a pd.Series indexed by date with integer values 0-100.
+    Caches to CSV to avoid repeated API calls.
+    """
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+
+    # Try loading from cache
+    if os.path.exists(cache_path):
+        cached = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        cached_series = cached["fng"].squeeze()
+        if cached_series.index.min() <= start and cached_series.index.max() >= end:
+            return cached_series.loc[start:end]
+
+    # Fetch from API
+    print("  Fetching Fear & Greed Index from alternative.me...")
+    try:
+        resp = requests.get(
+            "https://api.alternative.me/fng/",
+            params={"limit": "0", "format": "json"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()["data"]
+
+        dates = []
+        values = []
+        for entry in data:
+            dates.append(pd.Timestamp.fromtimestamp(int(entry["timestamp"])).normalize())
+            values.append(int(entry["value"]))
+
+        fng = pd.Series(values, index=dates, name="fng").sort_index()
+        fng = fng[~fng.index.duplicated(keep="first")]
+
+        # Cache
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        fng.to_frame().to_csv(cache_path)
+        print(f"  Cached FNG data ({len(fng)} days) -> {cache_path}")
+
+        return fng.loc[start:end]
+
+    except (requests.RequestException, KeyError, ValueError) as e:
+        print(f"  WARNING: FNG API failed ({e}). Using neutral value (50).")
+        idx = pd.bdate_range(start, end)
+        return pd.Series(50, index=idx, name="fng")
 
 
 def add_indicators(
@@ -56,7 +107,7 @@ def add_indicators(
 def compute_features(df: pd.DataFrame, window_size: int) -> dict:
     """Produce feature arrays from indicator DataFrame (no clipping).
 
-    Returns dict with keys: close_prices, pct_changes, sma_ratios, rsi_norm, dates.
+    Returns dict with keys: close_prices, pct_changes, sma_ratios, rsi_norm, fng_norm, buy_pressure, dates.
     Clipping is deferred to after train/val/test split so stats come from train only.
     """
     df = df.copy()
@@ -70,6 +121,15 @@ def compute_features(df: pd.DataFrame, window_size: int) -> dict:
     # Normalized RSI
     df["rsi_norm"] = df["rsi"] / 100.0
 
+    # Normalized FNG (0-100 -> 0-1)
+    df["fng_norm"] = df["fng"] / 100.0
+
+    # Buy pressure (taker_buy_volume / volume), 0-1, 0.5 = neutral
+    if "taker_buy_volume" in df.columns and "volume" in df.columns:
+        df["buy_pressure"] = (df["taker_buy_volume"] / df["volume"]).clip(0, 1).fillna(0.5)
+    else:
+        df["buy_pressure"] = 0.5
+
     # Drop rows with NaN (from indicators + pct_change)
     df = df.dropna()
 
@@ -82,6 +142,8 @@ def compute_features(df: pd.DataFrame, window_size: int) -> dict:
         "pct_changes": df["pct_change"].values.astype(np.float32),
         "sma_ratios": df["sma_ratio"].values.astype(np.float32),
         "rsi_norm": df["rsi_norm"].values.astype(np.float32),
+        "fng_norm": df["fng_norm"].values.astype(np.float32),
+        "buy_pressure": df["buy_pressure"].values.astype(np.float32),
         "dates": df.index.strftime("%Y-%m-%d").values,
     }
 
@@ -92,7 +154,7 @@ def compute_clip_stats(split: dict) -> dict:
     Returns dict mapping feature name to (mean, std).
     """
     stats = {}
-    for col in ["pct_changes", "sma_ratios", "rsi_norm"]:
+    for col in ["pct_changes", "sma_ratios", "rsi_norm", "fng_norm", "buy_pressure"]:
         mean = float(np.mean(split[col]))
         std = float(np.std(split[col]))
         stats[col] = (mean, std)
@@ -102,7 +164,7 @@ def compute_clip_stats(split: dict) -> dict:
 def apply_clip(split: dict, clip_stats: dict) -> dict:
     """Clip features to ±5 std devs using pre-computed stats."""
     split = {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in split.items()}
-    for col in ["pct_changes", "sma_ratios", "rsi_norm"]:
+    for col in ["pct_changes", "sma_ratios", "rsi_norm", "fng_norm", "buy_pressure"]:
         mean, std = clip_stats[col]
         if std > 0:
             split[col] = np.clip(split[col], mean - 5 * std, mean + 5 * std)
@@ -123,6 +185,8 @@ def split_data(
             "pct_changes": features["pct_changes"][mask],
             "sma_ratios": features["sma_ratios"][mask],
             "rsi_norm": features["rsi_norm"][mask],
+            "fng_norm": features["fng_norm"][mask],
+            "buy_pressure": features["buy_pressure"][mask],
             "dates": features["dates"][mask],
         }
 
@@ -136,11 +200,24 @@ def main(config_path: str = "configs/default.yaml"):
     env_cfg = config["env"]
 
     print(f"Fetching {data_cfg['asset']} from {data_cfg['start_date']} to {data_cfg['end_date']}...")
-    df = fetch_ohlcv(data_cfg["asset"], data_cfg["start_date"], data_cfg["end_date"])
+    if data_cfg.get("source") == "huggingface":
+        from data.fetch_hf import fetch_ohlcv_hf
+        hf_symbol = data_cfg.get("binance_symbol", "BTCUSDT")
+        hf_cache = data_cfg.get("hf_cache_dir", "data/hf_cache")
+        df = fetch_ohlcv_hf(hf_symbol, data_cfg["start_date"], data_cfg["end_date"], hf_cache)
+    else:
+        df = fetch_ohlcv(data_cfg["asset"], data_cfg["start_date"], data_cfg["end_date"])
     print(f"  Raw data: {len(df)} rows")
 
     df = clean_data(df)
     print(f"  After cleaning: {len(df)} rows")
+
+    # Fetch Fear & Greed Index
+    fng_cache = data_cfg.get("fng_cache_path", "data/fng_cache.csv")
+    fng_series = fetch_fng(data_cfg["start_date"], data_cfg["end_date"], cache_path=fng_cache)
+    df["fng"] = fng_series.reindex(df.index, method="ffill")
+    df["fng"] = df["fng"].bfill()  # fill any leading NaNs
+    print(f"  FNG data: {fng_series.notna().sum()} days matched")
 
     df = add_indicators(df, ind_cfg["sma_short"], ind_cfg["sma_long"], ind_cfg["rsi_period"])
     print(f"  After indicators: {len(df)} rows")

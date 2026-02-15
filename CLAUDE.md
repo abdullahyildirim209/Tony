@@ -6,11 +6,17 @@ Tony is a DQN-based reinforcement learning agent that trades a single asset (BTC
 
 ```
 tony/
-  configs/default.yaml   - All hyperparameters and paths
-  data/fetch_data.py     - Download, indicators, feature engineering, train/val/test split
-  env/trading_env.py     - Gymnasium TradingEnv (discrete Buy/Hold/Sell)
-  agent/train.py         - SB3 DQN training with multi-episode validation & early stopping
-  evaluation/backtest.py - Run agent + baselines, compute metrics, generate plots
+  configs/default.yaml     - All hyperparameters and paths
+  data/fetch_data.py       - Download, indicators, feature engineering, train/val/test split
+  data/fetch_hf.py         - HuggingFace Binance dataset loader + daily aggregation
+  env/trading_env.py       - Gymnasium TradingEnv (discrete Buy/Hold/Sell)
+  agent/train.py           - SB3 DQN training with multi-episode validation & early stopping
+  evaluation/backtest.py   - Run agent + baselines, compute metrics, generate plots
+  live/feature_engine.py   - Standalone 37-dim obs builder with rolling buffer
+  live/state_manager.py    - Position/portfolio tracker (mirrors env logic)
+  live/data_feed.py        - Historical replay + Binance live feed providers
+  live/paper_trader.py     - Paper trading orchestrator
+  live/run_paper.py        - CLI entry point for paper trading
 ```
 
 ## How to Run
@@ -26,6 +32,11 @@ python agent/train.py
 
 # 3. Backtest on test set + baselines
 python evaluation/backtest.py
+
+# 4. Paper trading (after training)
+python live/run_paper.py --mode replay    # test against historical data
+python live/run_paper.py --mode live      # real-time paper trading via Binance
+python live/run_paper.py --mode live --resume live/state/latest.json  # resume after crash
 ```
 
 Config override: pass a YAML path as the first argument, e.g. `python agent/train.py configs/custom.yaml`.
@@ -58,9 +69,17 @@ The initial implementation drew patterns from these open-source projects:
 
 5. **Forced start index support** (`env/trading_env.py`) - Added `forced_start_idx` option via `reset(options={"forced_start_idx": N})` to support multi-episode validation with varied start positions.
 
+6. **Fear & Greed Index feature** (`data/fetch_data.py`, `env/trading_env.py`) - Added Crypto Fear & Greed Index from alternative.me as an orthogonal sentiment signal. FNG is fetched via API, cached to CSV, normalized 0-1 (`fng_norm`), and included in the observation space. For non-crypto assets in multi-asset experiments, FNG is set to 0.5 (neutral). Observation space expanded from (35,) to (36,).
+
+7. **HuggingFace data integration** (`data/fetch_hf.py`, `data/fetch_data.py`) - Added support for `123olp/binance-futures-ohlcv-2018-2026` HuggingFace dataset as an alternative data source. Streams 1-min candles, aggregates to daily bars, caches as parquet. Extends training history from 2019 back to Feb 2018 (when FNG data begins). Configured via `data.source: "huggingface"` in YAML; `"yfinance"` still works as before.
+
+8. **Paper trading system** (`live/`) - Added a complete paper trading pipeline that reuses the trained DQN model for inference without real money. Components: `FeatureEngine` (standalone 37-dim obs builder with rolling buffer, mirrors `TradingEnv._get_obs()`), `StateManager` (position/portfolio tracker, mirrors `TradingEnv.step()`), `HistoricalReplayFeed` (replays test data), `BinanceLiveFeed` (fetches latest daily candle from Binance REST API). Supports crash recovery via JSON state persistence.
+
+9. **Buy pressure feature** (`data/fetch_hf.py`, `data/fetch_data.py`, `env/trading_env.py`, `live/`) - Added `buy_pressure = taker_buy_volume / volume` as a new feature measuring aggressive buyer ratio (0-1, 0.5=neutral). This is a Binance-only signal extracted from the HuggingFace dataset; yfinance fallback uses 0.5 (neutral). Observation space expanded from (36,) to (37,). Feature is clipped using train-only statistics like all other features.
+
 ## Key Architectural Decisions
 
-- **Observation space (35,):** `[30 pct_changes, sma_ratio, rsi_norm, flat_flag, long_flag, unrealized_pnl]`. Window of 30 daily returns gives the agent recent price context without raw price levels (scale-invariant).
+- **Observation space (37,):** `[30 pct_changes, sma_ratio, rsi_norm, fng_norm, buy_pressure, flat_flag, long_flag, unrealized_pnl]`. Window of 30 daily returns gives the agent recent price context without raw price levels (scale-invariant). FNG provides an orthogonal crowd-sentiment signal. Buy pressure (`taker_buy_volume / volume`) captures aggressive buyer ratio from Binance order flow.
 - **Action space:** Discrete(3) - Buy (all-in), Hold, Sell (all). Invalid actions (e.g., Buy when already long) are treated as Hold.
 - **Reward:** `log(portfolio_value_t / portfolio_value_{t-1}) - 0.001 * trade_executed`. Log returns align with Sharpe maximization; the trade penalty discourages churning.
 - **Termination:** Max drawdown >= 50% (terminated) or data exhaustion / episode length cap in train (truncated).
