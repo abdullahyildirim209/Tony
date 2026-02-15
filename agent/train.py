@@ -1,4 +1,4 @@
-"""SB3 DQN training with validation callback and early stopping."""
+"""SB3 PPO training with validation callback and early stopping."""
 
 import os
 import random
@@ -7,7 +7,7 @@ import sys
 import numpy as np
 import torch
 import yaml
-from stable_baselines3 import DQN
+from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -174,19 +174,20 @@ def train(config_path: str = "configs/default.yaml"):
     # Create model save directory
     os.makedirs(train_cfg["model_save_dir"], exist_ok=True)
 
-    # Instantiate DQN
-    model = DQN(
+    # Instantiate PPO
+    model = PPO(
         "MlpPolicy",
         train_env,
         learning_rate=agent_cfg["learning_rate"],
-        buffer_size=agent_cfg["buffer_size"],
-        learning_starts=agent_cfg["learning_starts"],
+        n_steps=agent_cfg["n_steps"],
         batch_size=agent_cfg["batch_size"],
+        n_epochs=agent_cfg["n_epochs"],
         gamma=agent_cfg["gamma"],
-        target_update_interval=agent_cfg["target_update_interval"],
-        exploration_initial_eps=agent_cfg["exploration_initial_eps"],
-        exploration_final_eps=agent_cfg["exploration_final_eps"],
-        exploration_fraction=agent_cfg["exploration_fraction"],
+        gae_lambda=agent_cfg["gae_lambda"],
+        clip_range=agent_cfg["clip_range"],
+        ent_coef=agent_cfg["ent_coef"],
+        vf_coef=agent_cfg["vf_coef"],
+        max_grad_norm=agent_cfg["max_grad_norm"],
         policy_kwargs={"net_arch": agent_cfg["net_arch"]},
         tensorboard_log=train_cfg["tensorboard_log"],
         seed=config["seed"],
@@ -204,14 +205,14 @@ def train(config_path: str = "configs/default.yaml"):
         n_val_episodes=val_cfg.get("n_val_episodes", 5),
     )
 
-    print(f"Starting DQN training for {train_cfg['total_timesteps']} timesteps...")
+    print(f"Starting PPO training for {train_cfg['total_timesteps']} timesteps...")
     print(f"  Train data: {len(train_env.close_prices)} steps")
     print(f"  Val data: {len(val_env.close_prices)} steps")
 
     model.learn(
         total_timesteps=train_cfg["total_timesteps"],
         callback=val_callback,
-        tb_log_name="DQN_tony",
+        tb_log_name="PPO_tony",
     )
 
     best_path = os.path.join(train_cfg["model_save_dir"], train_cfg["best_model_name"])

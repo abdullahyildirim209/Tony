@@ -92,6 +92,15 @@ def aggregate_to_daily(df_1min: pd.DataFrame) -> pd.DataFrame:
     Returns DataFrame with columns [open, high, low, close, volume, taker_buy_volume], DatetimeIndex named 'date'.
     """
     df = df_1min.copy()
+
+    # Filter corrupt 1-min rows where taker_buy_volume > volume
+    if "taker_buy_volume" in df.columns:
+        mask = df["taker_buy_volume"] <= df["volume"]
+        n_bad = (~mask).sum()
+        if n_bad > 0:
+            print(f"  Filtered {n_bad} corrupt rows (taker_buy_volume > volume)")
+            df = df[mask]
+
     df = df.set_index("timestamp")
 
     agg_dict = {

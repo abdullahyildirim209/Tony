@@ -8,7 +8,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
-from stable_baselines3 import DQN
+from stable_baselines3 import PPO
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from env.trading_env import TradingEnv
@@ -42,8 +42,8 @@ def make_env(data_path: str, config: dict) -> TradingEnv:
 
 
 def run_agent(model_path: str, env: TradingEnv) -> dict:
-    """Run trained DQN agent deterministically."""
-    model = DQN.load(model_path)
+    """Run trained PPO agent deterministically."""
+    model = PPO.load(model_path)
     obs, _ = env.reset()
     done = False
     while not done:
@@ -51,7 +51,7 @@ def run_agent(model_path: str, env: TradingEnv) -> dict:
         obs, _, terminated, truncated, _ = env.step(int(action))
         done = terminated or truncated
     return {
-        "name": "DQN Agent",
+        "name": "PPO Agent",
         "portfolio_values": list(env.portfolio_values),
         "actions": list(env.actions_taken),
         "metrics": env.get_episode_metrics(),
@@ -174,7 +174,7 @@ def plot_price_with_trades(
 
     plt.xlabel("Step")
     plt.ylabel("Price ($)")
-    plt.title("DQN Agent Trades on Price Chart")
+    plt.title("PPO Agent Trades on Price Chart")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -237,7 +237,7 @@ def backtest(config_path: str = "configs/default.yaml"):
     results = []
 
     # Run DQN agent
-    print("Running DQN Agent...")
+    print("Running PPO Agent...")
     env = make_env(test_data_path, config)
     agent_result = run_agent(model_path, env)
     results.append(agent_result)
