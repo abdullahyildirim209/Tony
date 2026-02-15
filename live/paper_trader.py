@@ -1,13 +1,14 @@
-"""Paper trading orchestrator: runs DQN model against live or historical data."""
+"""Paper trading orchestrator: runs PPO model against live or historical data."""
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import time
 
 import numpy as np
-from stable_baselines3 import DQN
+from stable_baselines3 import PPO
 
 from live.data_feed import BinanceLiveFeed, HistoricalReplayFeed
 from live.feature_engine import FeatureEngine
@@ -24,11 +25,13 @@ class PaperTrader:
         config: dict,
         feed,
         log_dir: str = "live/logs",
+        testnet_executor=None,
     ):
-        self.model = DQN.load(model_path)
+        self.model = PPO.load(model_path)
         self.config = config
         self.feed = feed
         self.log_dir = log_dir
+        self.testnet_executor = testnet_executor
 
         env_cfg = config["env"]
         ind_cfg = config["indicators"]
@@ -49,6 +52,7 @@ class PaperTrader:
 
         os.makedirs(log_dir, exist_ok=True)
         self._step_log: list[dict] = []
+        self._csv_path = os.path.join(log_dir, "paper_trading.csv")
 
     def warmup(self, historical_bars: list[dict]) -> None:
         """Feed historical bars to build indicator buffers before trading starts."""
@@ -84,12 +88,38 @@ class PaperTrader:
         if obs is None:
             return None
 
+        # Validate observation — skip day if NaN/Inf
+        if not np.all(np.isfinite(obs)):
+            bad = np.where(~np.isfinite(obs))[0].tolist()
+            print(f"  WARNING: NaN/Inf in obs at indices {bad} on {bar['date']}, skipping")
+            return None
+
         # Model prediction
         action, _ = self.model.predict(obs, deterministic=True)
         action = int(action)
 
+        # Capture pre-trade state for testnet order quantities
+        shares_before = self.state_manager.shares
+        cash_before = self.state_manager.cash
+
         # Execute
         result = self.state_manager.execute_action(action, price)
+
+        # Mirror trade on testnet if executor provided
+        if self.testnet_executor is not None and result["trade_executed"]:
+            symbol = self.config["data"].get("binance_symbol", "BTCUSDT")
+            if action == 0:  # Buy
+                self.testnet_executor.place_market_buy(cash_before, symbol=symbol)
+            elif action == 2:  # Sell
+                self.testnet_executor.place_market_sell(shares_before, symbol=symbol)
+
+        # Cumulative return
+        cum_return = (result["portfolio_value"] / self.state_manager.initial_cash) - 1.0
+
+        # Unrealized PnL
+        unrealized_pnl = 0.0
+        if self.state_manager.shares > 0 and self.state_manager.entry_price > 0:
+            unrealized_pnl = (price / self.state_manager.entry_price) - 1.0
 
         # Log
         step_info = {
@@ -102,10 +132,38 @@ class PaperTrader:
             "cash": self.state_manager.cash,
             "shares": self.state_manager.shares,
             "reward": result["reward"],
+            "unrealized_pnl": unrealized_pnl,
+            "cumulative_return": cum_return,
         }
         self._step_log.append(step_info)
 
+        # CSV logging
+        self._append_csv(step_info)
+
         return step_info
+
+    def _append_csv(self, step_info: dict) -> None:
+        """Append one row to the CSV trade log."""
+        file_exists = os.path.exists(self._csv_path)
+        fieldnames = [
+            "date", "close_price", "action", "position", "portfolio_value",
+            "unrealized_pnl", "trade_executed", "cumulative_return",
+        ]
+        row = {
+            "date": step_info["date"],
+            "close_price": f"{step_info['price']:.2f}",
+            "action": step_info["action_name"],
+            "position": "Long" if self.state_manager.shares > 0 else "Flat",
+            "portfolio_value": f"{step_info['portfolio_value']:.2f}",
+            "unrealized_pnl": f"{step_info.get('unrealized_pnl', 0):.4f}",
+            "trade_executed": step_info["trade_executed"],
+            "cumulative_return": f"{step_info.get('cumulative_return', 0):.4f}",
+        }
+        with open(self._csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
 
     def run_replay(self) -> dict:
         """Run full historical replay. Returns metrics dict."""

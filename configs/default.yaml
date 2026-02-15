@@ -58,6 +58,11 @@ evaluation:
   results_dir: "results"
   plots_dir: "results/plots"
 
+live:
+  warmup_days: 60
+  log_dir: "live/logs"
+  state_dir: "live/state"
+
 experiments:
   walk_forward:
     total_timesteps: 500000
