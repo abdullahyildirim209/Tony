@@ -1,6 +1,6 @@
 """Walk-forward testing across multiple market regimes.
 
-Trains and evaluates the DQN agent on expanding windows covering different
+Trains and evaluates the PPO agent on expanding windows covering different
 market conditions (crash, bull, bear, recovery).
 
 Run from tony/: python experiments/walk_forward.py
@@ -14,7 +14,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
-from stable_baselines3 import DQN
+from stable_baselines3 import PPO
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agent.train import set_seeds, ValidationCallback
@@ -45,7 +45,7 @@ def load_config(path: str = "configs/default.yaml") -> dict:
 def split_by_dates(features: dict, train_start: str, train_end: str, val_end: str, test_end: str):
     """Split features dict by date boundaries, filtering to [train_start, test_end)."""
     dates = features["dates"]
-    keys = ["close_prices", "pct_changes", "sma_ratios", "rsi_norm", "fng_norm", "dates"]
+    keys = ["close_prices", "pct_changes", "sma_ratios", "rsi_norm", "fng_norm", "buy_pressure", "dates"]
 
     def select(data, mask):
         return {k: data[k][mask] for k in keys}
@@ -71,6 +71,7 @@ def make_env_from_dict(data: dict, config: dict, mode: str) -> TradingEnv:
         sma_ratios=data["sma_ratios"],
         rsi_norm=data["rsi_norm"],
         fng_norm=data["fng_norm"],
+        buy_pressure=data.get("buy_pressure"),
         window_size=env_cfg["window_size"],
         episode_length=env_cfg["episode_length"],
         initial_cash=env_cfg["initial_cash"],
@@ -81,7 +82,7 @@ def make_env_from_dict(data: dict, config: dict, mode: str) -> TradingEnv:
 
 
 def train_fold(config: dict, train_data: dict, val_data: dict, save_dir: str, total_timesteps: int) -> str:
-    """Train DQN for one fold. Returns best model path."""
+    """Train PPO for one fold. Returns best model path."""
     agent_cfg = config["agent"]
     train_cfg = config["training"]
 
@@ -90,18 +91,19 @@ def train_fold(config: dict, train_data: dict, val_data: dict, save_dir: str, to
 
     os.makedirs(save_dir, exist_ok=True)
 
-    model = DQN(
+    model = PPO(
         "MlpPolicy",
         train_env,
         learning_rate=agent_cfg["learning_rate"],
-        buffer_size=agent_cfg["buffer_size"],
-        learning_starts=agent_cfg["learning_starts"],
+        n_steps=agent_cfg["n_steps"],
         batch_size=agent_cfg["batch_size"],
+        n_epochs=agent_cfg["n_epochs"],
         gamma=agent_cfg["gamma"],
-        target_update_interval=agent_cfg["target_update_interval"],
-        exploration_initial_eps=agent_cfg["exploration_initial_eps"],
-        exploration_final_eps=agent_cfg["exploration_final_eps"],
-        exploration_fraction=agent_cfg["exploration_fraction"],
+        gae_lambda=agent_cfg["gae_lambda"],
+        clip_range=agent_cfg["clip_range"],
+        ent_coef=agent_cfg["ent_coef"],
+        vf_coef=agent_cfg["vf_coef"],
+        max_grad_norm=agent_cfg["max_grad_norm"],
         policy_kwargs={"net_arch": agent_cfg["net_arch"]},
         seed=config["seed"],
         verbose=0,
@@ -128,10 +130,10 @@ def train_fold(config: dict, train_data: dict, val_data: dict, save_dir: str, to
 
 
 def run_backtest_on_fold(config: dict, test_data: dict, model_path: str) -> list[dict]:
-    """Run DQN + baselines on a test split. Returns list of result dicts."""
+    """Run PPO + baselines on a test split. Returns list of result dicts."""
     results = []
 
-    # DQN
+    # PPO
     env = make_env_from_dict(test_data, config, mode="test")
     results.append(run_agent(model_path, env))
 
@@ -152,7 +154,7 @@ def run_backtest_on_fold(config: dict, test_data: dict, model_path: str) -> list
 
 def print_regime_table(fold_results: dict):
     """Print per-regime summary across all strategies."""
-    strategies = ["DQN Agent", "Buy & Hold", "Random", "SMA Crossover"]
+    strategies = ["PPO Agent", "Buy & Hold", "Random", "SMA Crossover"]
     print(f"\n{'=' * 100}")
     print("  Walk-Forward Results by Regime")
     print(f"{'=' * 100}")
@@ -196,7 +198,7 @@ def generate_plots(fold_results: dict, plots_dir: str):
     """Generate walk-forward bar charts."""
     os.makedirs(plots_dir, exist_ok=True)
 
-    strategies = ["DQN Agent", "Buy & Hold", "Random", "SMA Crossover"]
+    strategies = ["PPO Agent", "Buy & Hold", "Random", "SMA Crossover"]
     fold_names = list(fold_results.keys())
     n_folds = len(fold_names)
     n_strats = len(strategies)
@@ -281,7 +283,11 @@ def main(config_path: str = "configs/default.yaml"):
     asset = config["data"]["asset"]
 
     print(f"Downloading {asset} from {global_start} to {global_end}...")
-    df = fetch_ohlcv(asset, global_start, global_end)
+    if config["data"].get("source") == "huggingface":
+        from data.fetch_hf import fetch_ohlcv_hf
+        df = fetch_ohlcv_hf(config["data"]["binance_symbol"], global_start, global_end, config["data"]["hf_cache_dir"])
+    else:
+        df = fetch_ohlcv(asset, global_start, global_end)
     df = clean_data(df)
     fng_cache = config["data"].get("fng_cache_path", "data/fng_cache.csv")
     fng_series = fetch_fng(global_start, global_end, cache_path=fng_cache)
