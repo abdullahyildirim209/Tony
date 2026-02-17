@@ -1,6 +1,6 @@
-# Tony - Single-Asset DQN Trading Agent
+# Tony - Single-Asset RL Trading Agent
 
-Tony is a DQN-based reinforcement learning agent that trades a single asset (BTC-USD by default) using Stable Baselines3. It downloads OHLCV data, computes technical indicators, trains a DQN agent in a custom Gymnasium environment, and evaluates performance against baselines (Buy & Hold, Random, SMA Crossover).
+Tony is a reinforcement learning agent that trades a single asset (BTC-USD by default) using Stable Baselines3. It downloads OHLCV data, computes technical indicators, trains RL agents (PPO/A2C/DQN ensemble) in a custom Gymnasium environment, and evaluates performance against baselines (Buy & Hold, Random, SMA Crossover).
 
 ## Project Structure
 
@@ -10,9 +10,12 @@ tony/
   data/fetch_data.py       - Download, indicators, feature engineering, train/val/test split
   data/fetch_hf.py         - HuggingFace Binance dataset loader + daily aggregation
   env/trading_env.py       - Gymnasium TradingEnv (discrete Buy/Hold/Sell)
-  agent/train.py           - SB3 DQN training with multi-episode validation & early stopping
+  agent/train.py           - SB3 PPO training with multi-episode validation & early stopping
+  agent/ensemble.py        - Multi-algorithm ensemble (PPO, A2C, DQN), best-by-Sortino selection
   evaluation/backtest.py   - Run agent + baselines, compute metrics, generate plots
-  live/feature_engine.py   - Standalone 37-dim obs builder with rolling buffer
+  experiments/walk_forward.py        - Walk-forward testing across market regimes
+  experiments/statistical_analysis.py - Bootstrap CIs, significance tests
+  live/feature_engine.py   - Standalone 38-dim obs builder with rolling buffer
   live/state_manager.py    - Position/portfolio tracker (mirrors env logic)
   live/data_feed.py        - Historical replay + Binance live feed providers
   live/paper_trader.py     - Paper trading orchestrator
@@ -27,13 +30,17 @@ All commands run from the `tony/` directory:
 # 1. Fetch data, compute features, split into train/val/test
 python data/fetch_data.py
 
-# 2. Train DQN agent (early stops on val Sharpe)
+# 2. Train agent (early stops on val Sortino)
 python agent/train.py
 
 # 3. Backtest on test set + baselines
 python evaluation/backtest.py
 
-# 4. Paper trading (after training)
+# 4. Walk-forward experiment (trains ensemble per fold)
+python experiments/walk_forward.py
+python experiments/statistical_analysis.py
+
+# 5. Paper trading (after training)
 python live/run_paper.py --mode replay    # test against historical data
 python live/run_paper.py --mode live      # real-time paper trading via Binance
 python live/run_paper.py --mode live --resume live/state/latest.json  # resume after crash
@@ -56,6 +63,10 @@ The initial implementation drew patterns from these open-source projects:
 | DQN algorithm reference | `ElegantRL/elegantrl/agents/AgentDQN.py` |
 | Sharpe/drawdown formulas | `FinRL-Trading/src/backtest/backtest_engine.py` |
 | Rolling Sharpe pattern | `FinRL-Trading/src/web/components.py` |
+| Terminal reward bonus | `ElegantRL/elegantrl/envs/` |
+| Multi-algorithm ensemble selection | `FinRL/finrl/agents/` |
+| Turbulence regime indicator | `FinRL/finrl/meta/` |
+| Sortino-based validation | `FinRL-Trading/src/backtest/` |
 
 ## Changelog (from initial implementation)
 
@@ -69,19 +80,37 @@ The initial implementation drew patterns from these open-source projects:
 
 5. **Forced start index support** (`env/trading_env.py`) - Added `forced_start_idx` option via `reset(options={"forced_start_idx": N})` to support multi-episode validation with varied start positions.
 
-6. **Fear & Greed Index feature** (`data/fetch_data.py`, `env/trading_env.py`) - Added Crypto Fear & Greed Index from alternative.me as an orthogonal sentiment signal. FNG is fetched via API, cached to CSV, normalized 0-1 (`fng_norm`), and included in the observation space. For non-crypto assets in multi-asset experiments, FNG is set to 0.5 (neutral). Observation space expanded from (35,) to (36,).
+6. **Fear & Greed Index feature** (`data/fetch_data.py`, `env/trading_env.py`) - Added Crypto Fear & Greed Index from alternative.me as an orthogonal sentiment signal. FNG is fetched via API, cached to CSV, normalized 0-1 (`fng_norm`), and included in the observation space.
 
-7. **HuggingFace data integration** (`data/fetch_hf.py`, `data/fetch_data.py`) - Added support for `123olp/binance-futures-ohlcv-2018-2026` HuggingFace dataset as an alternative data source. Streams 1-min candles, aggregates to daily bars, caches as parquet. Extends training history from 2019 back to Feb 2018 (when FNG data begins). Configured via `data.source: "huggingface"` in YAML; `"yfinance"` still works as before.
+7. **HuggingFace data integration** (`data/fetch_hf.py`, `data/fetch_data.py`) - Added support for `123olp/binance-futures-ohlcv-2018-2026` HuggingFace dataset as an alternative data source.
 
-8. **Paper trading system** (`live/`) - Added a complete paper trading pipeline that reuses the trained DQN model for inference without real money. Components: `FeatureEngine` (standalone 37-dim obs builder with rolling buffer, mirrors `TradingEnv._get_obs()`), `StateManager` (position/portfolio tracker, mirrors `TradingEnv.step()`), `HistoricalReplayFeed` (replays test data), `BinanceLiveFeed` (fetches latest daily candle from Binance REST API). Supports crash recovery via JSON state persistence.
+8. **Paper trading system** (`live/`) - Added a complete paper trading pipeline that reuses the trained model for inference without real money.
 
-9. **Buy pressure feature** (`data/fetch_hf.py`, `data/fetch_data.py`, `env/trading_env.py`, `live/`) - Added `buy_pressure = taker_buy_volume / volume` as a new feature measuring aggressive buyer ratio (0-1, 0.5=neutral). This is a Binance-only signal extracted from the HuggingFace dataset; yfinance fallback uses 0.5 (neutral). Observation space expanded from (36,) to (37,). Feature is clipped using train-only statistics like all other features.
+9. **Buy pressure feature** (`data/fetch_hf.py`, `data/fetch_data.py`, `env/trading_env.py`, `live/`) - Added `buy_pressure = taker_buy_volume / volume` as a new feature.
+
+10. **Terminal reward bonus** (`env/trading_env.py`) - At episode end, adds `mean(episode_returns) / (1 - gamma)` as a terminal bonus. Provides ~100x stronger gradient signal about overall episode quality, directly attacking the passivity problem where PPO converges to buy-and-hold. Configurable via `env.terminal_reward_bonus`.
+
+11. **Random initialization** (`env/trading_env.py`) - In train mode: randomizes initial cash ±10% and has a 30% chance of starting already long at a random entry price. Forces the agent to learn exit strategies, not just entry. Configurable via `env.random_init` and `env.random_init_long_prob`.
+
+12. **Enhanced metrics** (`env/trading_env.py`, `evaluation/backtest.py`) - Added Sortino ratio (downside risk only), Calmar ratio (annualized return / max drawdown), skewness, and excess kurtosis to `get_episode_metrics()` and `print_metrics_table()`.
+
+13. **Turbulence feature** (`data/fetch_data.py`, `env/trading_env.py`, `live/feature_engine.py`) - Computes turbulence as z-score of rolling volatility (63-day lookback). Added as observation feature (obs dim 37 → 38). Optionally force-sells when turbulence exceeds the 90th percentile of training data. Gives the agent explicit regime information.
+
+14. **Sortino-based model selection** (`agent/train.py`) - Changed `ValidationCallback` selection criterion from Sharpe to Sortino. Sharpe penalizes upside vol equally — passive models score well. Sortino better identifies actively profitable models. Configurable via `validation.selection_metric`.
+
+15. **Multi-algorithm ensemble** (`agent/ensemble.py`, `experiments/walk_forward.py`) - Trains PPO, A2C, and DQN per fold, selects best by validation Sortino. DQN's epsilon-greedy exploration is fundamentally different from PPO's entropy — may escape the passivity trap. Configurable via `ensemble.algorithms`.
+
+16. **Vectorized parallel environments** (`agent/train.py`) - Uses `SubprocVecEnv` with configurable parallel envs (default 4) for 2-4x training speedup. Each env gets a different random start for more diverse experience per batch. Configured via `training.n_envs`.
+
+17. **Trade logging** (`env/trading_env.py`) - Added `trade_log` list to TradingEnv that records entry_price, exit_price, pnl_pct, hold_steps for each completed trade. Used by statistical analysis for per-trade P&L distribution.
 
 ## Key Architectural Decisions
 
-- **Observation space (37,):** `[30 pct_changes, sma_ratio, rsi_norm, fng_norm, buy_pressure, flat_flag, long_flag, unrealized_pnl]`. Window of 30 daily returns gives the agent recent price context without raw price levels (scale-invariant). FNG provides an orthogonal crowd-sentiment signal. Buy pressure (`taker_buy_volume / volume`) captures aggressive buyer ratio from Binance order flow.
+- **Observation space (38,):** `[30 pct_changes, sma_ratio, rsi_norm, fng_norm, buy_pressure, turbulence, flat_flag, long_flag, unrealized_pnl]`. Window of 30 daily returns gives the agent recent price context without raw price levels (scale-invariant). Turbulence provides explicit regime awareness.
 - **Action space:** Discrete(3) - Buy (all-in), Hold, Sell (all). Invalid actions (e.g., Buy when already long) are treated as Hold.
-- **Reward:** `log(portfolio_value_t / portfolio_value_{t-1}) - 0.001 * trade_executed`. Log returns align with Sharpe maximization; the trade penalty discourages churning.
+- **Reward:** `log(portfolio_value_t / portfolio_value_{t-1}) - 0.001 * trade_executed` + terminal bonus of `mean(episode_returns) / (1 - gamma)` at episode end.
 - **Termination:** Max drawdown >= 50% (terminated) or data exhaustion / episode length cap in train (truncated).
 - **Feature clipping:** +-5 std devs using train-only statistics to prevent leakage.
-- **Validation:** 5 episodes averaged, spread across val data, to reduce model selection noise.
+- **Validation:** 5 episodes averaged, spread across val data, model selected by Sortino ratio.
+- **Ensemble:** PPO, A2C, DQN trained per fold; best by validation Sortino deployed for testing.
+- **Anti-passivity measures:** Terminal reward bonus, random init (30% chance starting long), Sortino selection, multi-algo ensemble (DQN epsilon-greedy), turbulence force-sell.

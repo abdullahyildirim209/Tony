@@ -1,4 +1,4 @@
-"""Custom Gymnasium trading environment for single-asset DQN trading."""
+"""Custom Gymnasium trading environment for single-asset RL trading."""
 
 from typing import Optional
 
@@ -10,15 +10,16 @@ from gymnasium import spaces
 class TradingEnv(gym.Env):
     """Single-asset trading environment with discrete Buy/Hold/Sell actions.
 
-    Observation space (37,):
+    Observation space (38,):
         [0:30]  - Last 30 daily pct changes
         [30]    - SMA ratio (sma_short / sma_long)
         [31]    - RSI normalized (0-1)
         [32]    - FNG normalized (0-1)
         [33]    - Buy pressure (taker_buy_volume / volume, 0-1)
-        [34]    - Position one-hot: flat
-        [35]    - Position one-hot: long
-        [36]    - Unrealized PnL % (0 if flat)
+        [34]    - Turbulence (z-score of rolling volatility)
+        [35]    - Position one-hot: flat
+        [36]    - Position one-hot: long
+        [37]    - Unrealized PnL % (0 if flat)
 
     Action space: Discrete(3) — 0=Buy, 1=Hold, 2=Sell
     """
@@ -33,11 +34,17 @@ class TradingEnv(gym.Env):
         rsi_norm: np.ndarray,
         fng_norm: Optional[np.ndarray] = None,
         buy_pressure: Optional[np.ndarray] = None,
+        turbulence: Optional[np.ndarray] = None,
         window_size: int = 30,
         episode_length: int = 252,
         initial_cash: float = 10000.0,
         transaction_cost: float = 0.001,
         max_drawdown_threshold: float = 0.50,
+        gamma: float = 0.99,
+        terminal_reward_bonus: bool = True,
+        random_init: bool = False,
+        random_init_long_prob: float = 0.3,
+        turbulence_threshold: Optional[float] = None,
         mode: str = "train",
     ):
         super().__init__()
@@ -49,16 +56,23 @@ class TradingEnv(gym.Env):
         n = len(close_prices)
         self.fng_norm = fng_norm.astype(np.float32) if fng_norm is not None else np.full(n, 0.5, dtype=np.float32)
         self.buy_pressure = buy_pressure.astype(np.float32) if buy_pressure is not None else np.full(n, 0.5, dtype=np.float32)
+        self.turbulence = turbulence.astype(np.float32) if turbulence is not None else np.zeros(n, dtype=np.float32)
 
         self.window_size = window_size
         self.episode_length = episode_length
         self.initial_cash = initial_cash
         self.transaction_cost = transaction_cost
         self.max_drawdown_threshold = max_drawdown_threshold
+        self.gamma = gamma
+        self.terminal_reward_bonus = terminal_reward_bonus
+        self.random_init = random_init and mode == "train"
+        self.random_init_long_prob = random_init_long_prob
+        self.turbulence_threshold = turbulence_threshold
         self.mode = mode
 
+        # Observation: 37 original + 1 turbulence = 38
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(37,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(38,), dtype=np.float32
         )
         self.action_space = spaces.Discrete(3)
 
@@ -73,6 +87,7 @@ class TradingEnv(gym.Env):
         self.win_count = 0
         self.loss_count = 0
         self.actions_taken = []
+        self.trade_log = []
 
         self._rng = np.random.default_rng()
 
@@ -94,6 +109,7 @@ class TradingEnv(gym.Env):
         rsi = self.rsi_norm[idx]
         fng = self.fng_norm[idx]
         bp = self.buy_pressure[idx]
+        turb = self.turbulence[idx]
 
         # Position encoding
         is_long = self.shares > 0
@@ -108,7 +124,7 @@ class TradingEnv(gym.Env):
 
         obs = np.concatenate([
             pct_window,
-            [sma_ratio, rsi, fng, bp, flat, long, unrealized_pnl],
+            [sma_ratio, rsi, fng, bp, turb, flat, long, unrealized_pnl],
         ]).astype(np.float32)
 
         return obs
@@ -135,17 +151,41 @@ class TradingEnv(gym.Env):
             self.start_idx = self.window_size
 
         self.current_step = 0
-        self.cash = self.initial_cash
-        self.shares = 0.0
-        self.entry_price = 0.0
         self.trade_count = 0
         self.win_count = 0
         self.loss_count = 0
-        self.portfolio_values = [self.initial_cash]
         self.actions_taken = []
+        self.trade_log = []
+
+        # Random initialization (train mode only)
+        if self.random_init:
+            # Randomize initial cash ±10%
+            cash_noise = self._rng.uniform(0.9, 1.1)
+            self.cash = self.initial_cash * cash_noise
+
+            # 30% chance of starting already long
+            if self._rng.random() < self.random_init_long_prob:
+                price = self.close_prices[self.start_idx]
+                # Random entry price within ±20% of current price
+                entry_factor = self._rng.uniform(0.8, 1.2)
+                self.entry_price = price * entry_factor
+                self.shares = self.cash / (price * (1.0 + self.transaction_cost))
+                self.cash -= self.shares * price * (1.0 + self.transaction_cost)
+            else:
+                self.shares = 0.0
+                self.entry_price = 0.0
+        else:
+            self.cash = self.initial_cash
+            self.shares = 0.0
+            self.entry_price = 0.0
+
+        # Compute initial portfolio value
+        idx = self.start_idx
+        init_value = self.cash + self.shares * self.close_prices[idx]
+        self.portfolio_values = [init_value]
 
         obs = self._get_obs()
-        info = {"portfolio_value": self.initial_cash}
+        info = {"portfolio_value": init_value}
         return obs, info
 
     def step(self, action):
@@ -154,21 +194,36 @@ class TradingEnv(gym.Env):
         prev_portfolio = self.portfolio_values[-1]
         trade_executed = False
 
+        # Turbulence force-sell: if turbulence exceeds threshold, override to sell
+        if (
+            self.turbulence_threshold is not None
+            and self.turbulence[idx] > self.turbulence_threshold
+            and self.shares > 0
+        ):
+            action = 2  # Force sell in high-turbulence regime
+
         # Execute action (fractional shares: go all-in or sell all)
         if action == 0:  # Buy
             if self.shares == 0 and self.cash > 0:
-                # Buy as many fractional shares as cash allows
                 affordable = self.cash / (price * (1.0 + self.transaction_cost))
                 self.shares = affordable
                 self.cash -= affordable * price * (1.0 + self.transaction_cost)
                 self.entry_price = price
+                self._entry_step = self.current_step
                 self.trade_count += 1
                 trade_executed = True
         elif action == 2:  # Sell
             if self.shares > 0:
                 proceeds = self.shares * price * (1.0 - self.transaction_cost)
                 self.cash += proceeds
-                # Track win/loss
+                pnl_pct = (price / self.entry_price) - 1.0 if self.entry_price > 0 else 0.0
+                hold_steps = self.current_step - getattr(self, "_entry_step", 0)
+                self.trade_log.append({
+                    "entry_price": float(self.entry_price),
+                    "exit_price": float(price),
+                    "pnl_pct": float(pnl_pct),
+                    "hold_steps": int(hold_steps),
+                })
                 if price > self.entry_price:
                     self.win_count += 1
                 else:
@@ -216,6 +271,15 @@ class TradingEnv(gym.Env):
         if new_idx >= len(self.close_prices) - 1:
             truncated = True
 
+        # Terminal reward bonus: add mean(episode_returns) / (1 - gamma) at episode end
+        if (terminated or truncated) and self.terminal_reward_bonus:
+            values = np.array(self.portfolio_values, dtype=np.float64)
+            if len(values) > 1:
+                ep_returns = np.diff(values) / values[:-1]
+                ep_returns = ep_returns[np.isfinite(ep_returns)]
+                if len(ep_returns) > 0:
+                    reward += float(np.mean(ep_returns)) / (1.0 - self.gamma)
+
         info = {
             "portfolio_value": portfolio_value,
             "trade_executed": trade_executed,
@@ -245,6 +309,7 @@ class TradingEnv(gym.Env):
         rsi = self.rsi_norm[idx]
         fng = self.fng_norm[idx]
         bp = self.buy_pressure[idx]
+        turb = self.turbulence[idx]
         is_long = self.shares > 0
         flat = 1.0 if not is_long else 0.0
         long = 1.0 if is_long else 0.0
@@ -256,7 +321,7 @@ class TradingEnv(gym.Env):
 
         return np.concatenate([
             pct_window,
-            [sma_ratio, rsi, fng, bp, flat, long, unrealized_pnl],
+            [sma_ratio, rsi, fng, bp, turb, flat, long, unrealized_pnl],
         ]).astype(np.float32)
 
     def get_episode_metrics(self) -> dict:
@@ -276,10 +341,40 @@ class TradingEnv(gym.Env):
         else:
             sharpe = 0.0
 
+        # Sortino ratio (downside deviation only)
+        if len(daily_returns) > 1:
+            downside = daily_returns[daily_returns < 0]
+            downside_std = np.std(downside) if len(downside) > 0 else 0.0
+            sortino = (np.mean(daily_returns) / downside_std) * np.sqrt(252) if downside_std > 0 else 0.0
+        else:
+            sortino = 0.0
+
         # Max drawdown
         running_max = np.maximum.accumulate(values)
         drawdowns = (running_max - values) / running_max
         max_drawdown = float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
+
+        # Calmar ratio (annualized return / max drawdown)
+        n_days = len(daily_returns)
+        if max_drawdown > 0 and n_days > 0:
+            annualized_return = (1.0 + cumulative_return) ** (252.0 / n_days) - 1.0
+            calmar = annualized_return / max_drawdown
+        else:
+            calmar = 0.0
+
+        # Skewness and kurtosis of daily returns
+        if len(daily_returns) > 2:
+            mean_r = np.mean(daily_returns)
+            std_r = np.std(daily_returns)
+            if std_r > 0:
+                skewness = float(np.mean(((daily_returns - mean_r) / std_r) ** 3))
+                kurtosis = float(np.mean(((daily_returns - mean_r) / std_r) ** 4) - 3.0)
+            else:
+                skewness = 0.0
+                kurtosis = 0.0
+        else:
+            skewness = 0.0
+            kurtosis = 0.0
 
         # Win rate
         total_trades = self.win_count + self.loss_count
@@ -288,7 +383,11 @@ class TradingEnv(gym.Env):
         return {
             "cumulative_return": float(cumulative_return),
             "sharpe_ratio": float(sharpe),
+            "sortino_ratio": float(sortino),
             "max_drawdown": float(max_drawdown),
+            "calmar_ratio": float(calmar),
+            "skewness": float(skewness),
+            "kurtosis": float(kurtosis),
             "trade_count": self.trade_count,
             "win_rate": float(win_rate),
         }

@@ -18,6 +18,7 @@ from stable_baselines3 import PPO
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agent.train import set_seeds, ValidationCallback
+from agent.ensemble import train_ensemble
 from data.fetch_data import (
     fetch_ohlcv,
     clean_data,
@@ -45,10 +46,10 @@ def load_config(path: str = "configs/default.yaml") -> dict:
 def split_by_dates(features: dict, train_start: str, train_end: str, val_end: str, test_end: str):
     """Split features dict by date boundaries, filtering to [train_start, test_end)."""
     dates = features["dates"]
-    keys = ["close_prices", "pct_changes", "sma_ratios", "rsi_norm", "fng_norm", "buy_pressure", "dates"]
+    keys = [k for k in features.keys() if isinstance(features[k], np.ndarray)]
 
     def select(data, mask):
-        return {k: data[k][mask] for k in keys}
+        return {k: data[k][mask] for k in keys if k in data}
 
     # Only use data within the fold's full range
     range_mask = (dates >= train_start) & (dates < test_end)
@@ -62,9 +63,11 @@ def split_by_dates(features: dict, train_start: str, train_end: str, val_end: st
     return select(ranged, train_mask), select(ranged, val_mask), select(ranged, test_mask)
 
 
-def make_env_from_dict(data: dict, config: dict, mode: str) -> TradingEnv:
+def make_env_from_dict(data: dict, config: dict, mode: str, turbulence_threshold: float = None) -> TradingEnv:
     """Create TradingEnv from a feature dict."""
     env_cfg = config["env"]
+    agent_cfg = config.get("agent", {})
+    is_test = mode in ("val", "test")
     return TradingEnv(
         close_prices=data["close_prices"],
         pct_changes=data["pct_changes"],
@@ -72,22 +75,36 @@ def make_env_from_dict(data: dict, config: dict, mode: str) -> TradingEnv:
         rsi_norm=data["rsi_norm"],
         fng_norm=data["fng_norm"],
         buy_pressure=data.get("buy_pressure"),
+        turbulence=data.get("turbulence"),
         window_size=env_cfg["window_size"],
         episode_length=env_cfg["episode_length"],
         initial_cash=env_cfg["initial_cash"],
         transaction_cost=env_cfg["transaction_cost"],
         max_drawdown_threshold=env_cfg["max_drawdown_threshold"],
+        gamma=agent_cfg.get("gamma", 0.99),
+        terminal_reward_bonus=not is_test and env_cfg.get("terminal_reward_bonus", True),
+        random_init=env_cfg.get("random_init", False),
+        random_init_long_prob=env_cfg.get("random_init_long_prob", 0.3),
+        turbulence_threshold=turbulence_threshold,
         mode=mode,
     )
 
 
-def train_fold(config: dict, train_data: dict, val_data: dict, save_dir: str, total_timesteps: int) -> str:
+def compute_turbulence_threshold(train_data: dict, percentile: float = 90) -> float:
+    """Compute turbulence threshold from training data."""
+    if "turbulence" in train_data:
+        return float(np.percentile(train_data["turbulence"], percentile))
+    return None
+
+
+def train_fold(config: dict, train_data: dict, val_data: dict, save_dir: str, total_timesteps: int,
+               turbulence_threshold: float = None) -> str:
     """Train PPO for one fold. Returns best model path."""
     agent_cfg = config["agent"]
     train_cfg = config["training"]
 
-    train_env = make_env_from_dict(train_data, config, mode="train")
-    val_env = make_env_from_dict(val_data, config, mode="val")
+    train_env = make_env_from_dict(train_data, config, mode="train", turbulence_threshold=turbulence_threshold)
+    val_env = make_env_from_dict(val_data, config, mode="val", turbulence_threshold=turbulence_threshold)
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -117,6 +134,7 @@ def train_fold(config: dict, train_data: dict, val_data: dict, save_dir: str, to
         model_save_dir=save_dir,
         best_model_name="best_model",
         n_val_episodes=val_cfg.get("n_val_episodes", 5),
+        selection_metric=val_cfg.get("selection_metric", "sortino_ratio"),
         verbose=0,
     )
 
@@ -130,24 +148,25 @@ def train_fold(config: dict, train_data: dict, val_data: dict, save_dir: str, to
     return best_path
 
 
-def run_backtest_on_fold(config: dict, test_data: dict, model_path: str) -> list[dict]:
+def run_backtest_on_fold(config: dict, test_data: dict, model_path: str,
+                         turbulence_threshold: float = None) -> list[dict]:
     """Run PPO + baselines on a test split. Returns list of result dicts."""
     results = []
 
     # PPO
-    env = make_env_from_dict(test_data, config, mode="test")
+    env = make_env_from_dict(test_data, config, mode="test", turbulence_threshold=turbulence_threshold)
     results.append(run_agent(model_path, env))
 
     # Buy & Hold
-    env = make_env_from_dict(test_data, config, mode="test")
+    env = make_env_from_dict(test_data, config, mode="test", turbulence_threshold=None)
     results.append(run_buy_and_hold(env))
 
     # Random
-    env = make_env_from_dict(test_data, config, mode="test")
+    env = make_env_from_dict(test_data, config, mode="test", turbulence_threshold=None)
     results.append(run_random(env, seed=config["seed"]))
 
     # SMA Crossover
-    env = make_env_from_dict(test_data, config, mode="test")
+    env = make_env_from_dict(test_data, config, mode="test", turbulence_threshold=None)
     results.append(run_sma_crossover(env))
 
     return results
@@ -332,21 +351,52 @@ def main(config_path: str = "configs/default.yaml"):
         val_split = apply_clip(val_split, clip_stats)
         test_split = apply_clip(test_split, clip_stats)
 
-        # Save fold data
+        # Compute turbulence threshold from training data
+        turb_threshold = compute_turbulence_threshold(
+            train_split,
+            config.get("env", {}).get("turbulence_threshold_pct", 90),
+        )
+        if turb_threshold is not None:
+            print(f"  Turbulence threshold: {turb_threshold:.4f}")
+
+        # Save fold data (include turbulence threshold)
         data_dir = f"data/walk_forward/{name}"
         os.makedirs(data_dir, exist_ok=True)
-        for split_name, split_data in [("train", train_split), ("val", val_split), ("test", test_split)]:
-            np.savez(os.path.join(data_dir, f"{split_name}.npz"), **split_data)
+        train_extra = dict(train_split)
+        if turb_threshold is not None:
+            train_extra["turbulence_threshold"] = np.float32(turb_threshold)
+        for split_name, split_data_dict in [("train", train_extra), ("val", val_split), ("test", test_split)]:
+            np.savez(os.path.join(data_dir, f"{split_name}.npz"), **split_data_dict)
 
         # Train
         model_dir = f"models/walk_forward/{name}"
-        print(f"  Training ({total_timesteps} timesteps)...")
-        model_path = train_fold(config, train_split, val_split, model_dir, total_timesteps)
-        print(f"  Model saved: {model_path}")
+        ensemble_cfg = config.get("ensemble", {})
+        ensemble_algos = ensemble_cfg.get("algorithms", [])
+
+        if len(ensemble_algos) > 1:
+            print(f"  Ensemble training ({total_timesteps} timesteps, algos: {ensemble_algos})...")
+            model_path, best_algo = train_ensemble(
+                make_train_env=lambda: make_env_from_dict(train_split, config, "train", turb_threshold),
+                make_val_env=lambda: make_env_from_dict(val_split, config, "val", turb_threshold),
+                config=config,
+                save_dir=model_dir,
+                total_timesteps=total_timesteps,
+            )
+            # Copy best ensemble model to standard location for compatibility
+            import shutil
+            canonical_path = os.path.join(model_dir, "best_model")
+            shutil.copy2(model_path + ".zip", canonical_path + ".zip")
+            model_path = canonical_path
+            print(f"  Best algorithm: {best_algo}, model saved: {model_path}")
+        else:
+            print(f"  Training PPO ({total_timesteps} timesteps)...")
+            model_path = train_fold(config, train_split, val_split, model_dir, total_timesteps,
+                                    turbulence_threshold=turb_threshold)
+            print(f"  Model saved: {model_path}")
 
         # Backtest
         print("  Running backtest...")
-        results = run_backtest_on_fold(config, test_split, model_path)
+        results = run_backtest_on_fold(config, test_split, model_path, turbulence_threshold=turb_threshold)
         fold_results[name] = results
 
         # Print fold metrics

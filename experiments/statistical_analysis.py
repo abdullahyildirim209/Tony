@@ -19,12 +19,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 from scipy import stats
-from stable_baselines3 import DQN
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agent.train import set_seeds
 from env.trading_env import TradingEnv
-from evaluation.backtest import run_buy_and_hold
+from evaluation.backtest import run_buy_and_hold, _load_model
 
 
 def load_config(path: str = "configs/default.yaml") -> dict:
@@ -36,42 +35,35 @@ def make_env_from_npz(data_path: str, config: dict, mode: str) -> TradingEnv:
     """Create TradingEnv from .npz file."""
     data = np.load(data_path, allow_pickle=True)
     env_cfg = config["env"]
+    agent_cfg = config.get("agent", {})
+
+    turb_threshold = None
+    if "turbulence_threshold" in data:
+        turb_threshold = float(data["turbulence_threshold"])
+
     return TradingEnv(
         close_prices=data["close_prices"],
         pct_changes=data["pct_changes"],
         sma_ratios=data["sma_ratios"],
         rsi_norm=data["rsi_norm"],
-        fng_norm=data["fng_norm"],
+        fng_norm=data["fng_norm"] if "fng_norm" in data else None,
+        buy_pressure=data["buy_pressure"] if "buy_pressure" in data else None,
+        turbulence=data["turbulence"] if "turbulence" in data else None,
         window_size=env_cfg["window_size"],
         episode_length=env_cfg["episode_length"],
         initial_cash=env_cfg["initial_cash"],
         transaction_cost=env_cfg["transaction_cost"],
         max_drawdown_threshold=env_cfg["max_drawdown_threshold"],
-        mode=mode,
-    )
-
-
-def make_env_from_dict(data: dict, config: dict, mode: str) -> TradingEnv:
-    """Create TradingEnv from a feature dict."""
-    env_cfg = config["env"]
-    return TradingEnv(
-        close_prices=data["close_prices"],
-        pct_changes=data["pct_changes"],
-        sma_ratios=data["sma_ratios"],
-        rsi_norm=data["rsi_norm"],
-        fng_norm=data["fng_norm"],
-        window_size=env_cfg["window_size"],
-        episode_length=env_cfg["episode_length"],
-        initial_cash=env_cfg["initial_cash"],
-        transaction_cost=env_cfg["transaction_cost"],
-        max_drawdown_threshold=env_cfg["max_drawdown_threshold"],
+        gamma=agent_cfg.get("gamma", 0.99),
+        terminal_reward_bonus=False,
+        turbulence_threshold=turb_threshold,
         mode=mode,
     )
 
 
 def run_and_collect(model_path: str, env: TradingEnv) -> tuple[list[dict], np.ndarray]:
-    """Run DQN agent and return (trade_log, daily_returns)."""
-    model = DQN.load(model_path)
+    """Run agent and return (trade_log, daily_returns)."""
+    model = _load_model(model_path)
     obs, _ = env.reset()
     done = False
     while not done:
@@ -82,7 +74,7 @@ def run_and_collect(model_path: str, env: TradingEnv) -> tuple[list[dict], np.nd
     values = np.array(env.portfolio_values, dtype=np.float64)
     daily_returns = np.diff(values) / values[:-1]
     daily_returns = daily_returns[np.isfinite(daily_returns)]
-    return list(env.trade_log), daily_returns
+    return list(getattr(env, "trade_log", [])), daily_returns
 
 
 def run_bh_and_collect(env: TradingEnv) -> np.ndarray:
@@ -135,7 +127,7 @@ def generate_plots(
     trade_pnls: np.ndarray,
     bootstrap_sharpes: np.ndarray,
     sharpe_ci: tuple[float, float],
-    dqn_daily: np.ndarray,
+    agent_daily: np.ndarray,
     bh_daily: np.ndarray,
     plots_dir: str,
 ):
@@ -173,14 +165,14 @@ def generate_plots(
     plt.close(fig)
 
     # Daily returns comparison
-    min_len = min(len(dqn_daily), len(bh_daily))
+    min_len = min(len(agent_daily), len(bh_daily))
     if min_len > 0:
         fig, ax = plt.subplots(figsize=(14, 5))
-        ax.plot(np.cumsum(dqn_daily[:min_len]) * 100, label="DQN", alpha=0.8)
+        ax.plot(np.cumsum(agent_daily[:min_len]) * 100, label="Agent", alpha=0.8)
         ax.plot(np.cumsum(bh_daily[:min_len]) * 100, label="Buy & Hold", alpha=0.8)
         ax.set_xlabel("Day")
         ax.set_ylabel("Cumulative Daily Return (%)")
-        ax.set_title("DQN vs Buy & Hold: Cumulative Daily Returns")
+        ax.set_title("Agent vs Buy & Hold: Cumulative Daily Returns")
         ax.legend()
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
@@ -199,31 +191,42 @@ def collect_walk_forward_results(config: dict):
         return None, None, None, None
 
     all_trade_logs = []
-    all_dqn_daily = []
+    all_agent_daily = []
     all_bh_daily = []
 
-    fold_names = sorted(os.listdir(folds_dir))
+    fold_names = sorted(d for d in os.listdir(folds_dir)
+                        if os.path.isdir(os.path.join(folds_dir, d)))
     for fold_name in fold_names:
         test_path = os.path.join(folds_dir, fold_name, "test.npz")
+        train_path = os.path.join(folds_dir, fold_name, "train.npz")
         model_path = os.path.join(models_dir, fold_name, "best_model")
         if not os.path.exists(test_path) or not os.path.exists(model_path + ".zip"):
             continue
 
+        # Load turbulence threshold from train.npz if available
+        turb_threshold = None
+        if os.path.exists(train_path):
+            train_data = np.load(train_path, allow_pickle=True)
+            if "turbulence_threshold" in train_data:
+                turb_threshold = float(train_data["turbulence_threshold"])
+
         env = make_env_from_npz(test_path, config, mode="test")
-        trade_log, dqn_daily = run_and_collect(model_path, env)
+        if turb_threshold is not None:
+            env.turbulence_threshold = turb_threshold
+        trade_log, agent_daily = run_and_collect(model_path, env)
         all_trade_logs.extend(trade_log)
-        all_dqn_daily.append(dqn_daily)
+        all_agent_daily.append(agent_daily)
 
         bh_env = make_env_from_npz(test_path, config, mode="test")
         bh_daily = run_bh_and_collect(bh_env)
         all_bh_daily.append(bh_daily)
 
-    if not all_dqn_daily:
+    if not all_agent_daily:
         return None, None, None, None
 
     return (
         all_trade_logs,
-        np.concatenate(all_dqn_daily),
+        np.concatenate(all_agent_daily),
         np.concatenate(all_bh_daily),
         len(fold_names),
     )
@@ -234,7 +237,7 @@ def main(config_path: str = "configs/default.yaml"):
     set_seeds(config["seed"])
     rng = np.random.default_rng(config["seed"])
 
-    stat_cfg = config["experiments"]["statistical"]
+    stat_cfg = config.get("experiments", {}).get("statistical", {})
     n_bootstrap = stat_cfg.get("n_bootstrap", 10000)
     confidence = stat_cfg.get("confidence_level", 0.95)
 
@@ -245,12 +248,12 @@ def main(config_path: str = "configs/default.yaml"):
     # Try walk-forward aggregate first
     print("Checking for walk-forward results...")
     wf_result = collect_walk_forward_results(config)
-    wf_trades, wf_dqn_daily, wf_bh_daily, n_folds = wf_result
+    wf_trades, wf_agent_daily, wf_bh_daily, n_folds = wf_result
 
     if wf_trades is not None and len(wf_trades) > 0:
         print(f"  Found walk-forward data ({n_folds} folds, {len(wf_trades)} trades)")
         trade_log = wf_trades
-        dqn_daily = wf_dqn_daily
+        agent_daily = wf_agent_daily
         bh_daily = wf_bh_daily
         source = f"walk-forward ({n_folds} folds)"
     else:
@@ -266,7 +269,7 @@ def main(config_path: str = "configs/default.yaml"):
             return
 
         env = make_env_from_npz(test_path, config, mode="test")
-        trade_log, dqn_daily = run_and_collect(model_path, env)
+        trade_log, agent_daily = run_and_collect(model_path, env)
 
         bh_env = make_env_from_npz(test_path, config, mode="test")
         bh_daily = run_bh_and_collect(bh_env)
@@ -292,18 +295,18 @@ def main(config_path: str = "configs/default.yaml"):
         print(f"  Mean hold: {np.mean(hold_steps):.1f} steps")
 
     # Sharpe
-    sharpe = compute_sharpe(dqn_daily)
+    sharpe = compute_sharpe(agent_daily)
     print(f"\n  Sharpe: {sharpe:.3f}")
 
     # Bootstrap CIs
-    if len(dqn_daily) > 10:
+    if len(agent_daily) > 10:
         bootstrap_sharpes, sharpe_lo, sharpe_hi = bootstrap_sharpe(
-            dqn_daily, n_bootstrap, confidence, rng
+            agent_daily, n_bootstrap, confidence, rng
         )
         print(f"  Sharpe [{confidence*100:.0f}% CI]: [{sharpe_lo:.3f}, {sharpe_hi:.3f}]")
 
-        ret_lo, ret_hi = bootstrap_return(dqn_daily, n_bootstrap, confidence, rng)
-        cum_return = float(np.prod(1 + dqn_daily) - 1)
+        ret_lo, ret_hi = bootstrap_return(agent_daily, n_bootstrap, confidence, rng)
+        cum_return = float(np.prod(1 + agent_daily) - 1)
         print(f"  Return: {cum_return:.2%} [{confidence*100:.0f}% CI: {ret_lo:.2%}, {ret_hi:.2%}]")
     else:
         bootstrap_sharpes = np.array([sharpe])
@@ -318,16 +321,16 @@ def main(config_path: str = "configs/default.yaml"):
     else:
         print("\n  t-test: not enough trades")
 
-    # Wilcoxon signed-rank: DQN vs B&H daily returns
-    min_len = min(len(dqn_daily), len(bh_daily))
+    # Wilcoxon signed-rank: Agent vs B&H daily returns
+    min_len = min(len(agent_daily), len(bh_daily))
     if min_len > 10:
-        diff = dqn_daily[:min_len] - bh_daily[:min_len]
+        diff = agent_daily[:min_len] - bh_daily[:min_len]
         # Remove zeros for Wilcoxon
         nonzero = diff[diff != 0]
         if len(nonzero) > 10:
             w_stat, w_pvalue = stats.wilcoxon(nonzero)
             sig = "*" if w_pvalue < 0.05 else ""
-            print(f"  DQN vs B&H (Wilcoxon): W={w_stat:.0f}, p={w_pvalue:.4f} {sig}")
+            print(f"  Agent vs B&H (Wilcoxon): W={w_stat:.0f}, p={w_pvalue:.4f} {sig}")
         else:
             print("  Wilcoxon: not enough non-zero differences")
     else:
@@ -339,7 +342,7 @@ def main(config_path: str = "configs/default.yaml"):
         trade_pnls,
         bootstrap_sharpes,
         (sharpe_lo, sharpe_hi),
-        dqn_daily,
+        agent_daily,
         bh_daily,
         plots_dir,
     )

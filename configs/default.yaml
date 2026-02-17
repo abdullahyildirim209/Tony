@@ -17,11 +17,16 @@ env:
   initial_cash: 10000
   transaction_cost: 0.001
   max_drawdown_threshold: 0.50
+  terminal_reward_bonus: true
+  random_init: true
+  random_init_long_prob: 0.3
+  turbulence_threshold_pct: 90
 
 indicators:
   sma_short: 7
   sma_long: 21
   rsi_period: 14
+  turbulence_lookback: 63
 
 agent:
   algorithm: "PPO"
@@ -43,12 +48,34 @@ training:
   total_timesteps: 500000
   validate_every: 10000
   early_stopping_patience: 5
+  n_envs: 4
   tensorboard_log: "runs"
   model_save_dir: "models"
   best_model_name: "best_model"
 
 validation:
   n_val_episodes: 5
+  selection_metric: "sortino_ratio"
+
+ensemble:
+  algorithms:
+    - "ppo"
+    - "a2c"
+    - "dqn"
+  algorithm_kwargs:
+    ppo:
+      n_steps: 2048
+      batch_size: 64
+      n_epochs: 10
+      ent_coef: 0.01
+    a2c:
+      n_steps: 128
+      ent_coef: 0.01
+    dqn:
+      batch_size: 64
+      learning_starts: 1000
+      exploration_fraction: 0.3
+      exploration_final_eps: 0.05
 
 evaluation:
   baselines:
@@ -92,3 +119,6 @@ experiments:
         train_end: "2023-07-01"
         val_end: "2024-04-01"
         test_end: "2025-01-01"
+  statistical:
+    n_bootstrap: 10000
+    confidence_level: 0.95

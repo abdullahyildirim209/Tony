@@ -8,10 +8,21 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, A2C, DQN
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from env.trading_env import TradingEnv
+
+
+def _load_model(model_path: str):
+    """Load an SB3 model, auto-detecting the algorithm type."""
+    # Try each algorithm type
+    for algo_cls in [PPO, A2C, DQN]:
+        try:
+            return algo_cls.load(model_path)
+        except Exception:
+            continue
+    raise ValueError(f"Could not load model from {model_path}")
 
 
 def load_config(path: str = "configs/default.yaml") -> dict:
@@ -22,6 +33,12 @@ def load_config(path: str = "configs/default.yaml") -> dict:
 def make_env(data_path: str, config: dict) -> TradingEnv:
     data = np.load(data_path, allow_pickle=True)
     env_cfg = config["env"]
+    agent_cfg = config.get("agent", {})
+
+    turb_threshold = None
+    if "turbulence_threshold" in data:
+        turb_threshold = float(data["turbulence_threshold"])
+
     return TradingEnv(
         close_prices=data["close_prices"],
         pct_changes=data["pct_changes"],
@@ -29,11 +46,15 @@ def make_env(data_path: str, config: dict) -> TradingEnv:
         rsi_norm=data["rsi_norm"],
         fng_norm=data["fng_norm"] if "fng_norm" in data else None,
         buy_pressure=data["buy_pressure"] if "buy_pressure" in data else None,
+        turbulence=data["turbulence"] if "turbulence" in data else None,
         window_size=env_cfg["window_size"],
         episode_length=env_cfg["episode_length"],
         initial_cash=env_cfg["initial_cash"],
         transaction_cost=env_cfg["transaction_cost"],
         max_drawdown_threshold=env_cfg["max_drawdown_threshold"],
+        gamma=agent_cfg.get("gamma", 0.99),
+        terminal_reward_bonus=False,
+        turbulence_threshold=turb_threshold,
         mode="test",
     )
 
@@ -42,8 +63,8 @@ def make_env(data_path: str, config: dict) -> TradingEnv:
 
 
 def run_agent(model_path: str, env: TradingEnv) -> dict:
-    """Run trained PPO agent deterministically."""
-    model = PPO.load(model_path)
+    """Run trained agent deterministically (supports PPO, A2C, DQN)."""
+    model = _load_model(model_path)
     obs, _ = env.reset()
     done = False
     while not done:
@@ -204,7 +225,7 @@ def plot_drawdown_curves(results: list[dict], save_path: str):
 
 def print_metrics_table(results: list[dict]):
     """Print formatted comparison table."""
-    header = f"{'Strategy':<16} {'Return':>10} {'Sharpe':>8} {'MaxDD':>8} {'Trades':>7} {'WinRate':>8}"
+    header = f"{'Strategy':<16} {'Return':>10} {'Sharpe':>8} {'Sortino':>8} {'MaxDD':>8} {'Calmar':>8} {'Trades':>7} {'WinRate':>8} {'Skew':>7} {'Kurt':>7}"
     print("\n" + "=" * len(header))
     print(header)
     print("-" * len(header))
@@ -214,9 +235,13 @@ def print_metrics_table(results: list[dict]):
             f"{r['name']:<16} "
             f"{m['cumulative_return']:>9.2%} "
             f"{m['sharpe_ratio']:>8.3f} "
+            f"{m.get('sortino_ratio', 0):>8.3f} "
             f"{m['max_drawdown']:>7.2%} "
+            f"{m.get('calmar_ratio', 0):>8.3f} "
             f"{m['trade_count']:>7d} "
-            f"{m['win_rate']:>7.1%}"
+            f"{m['win_rate']:>7.1%} "
+            f"{m.get('skewness', 0):>7.3f} "
+            f"{m.get('kurtosis', 0):>7.3f}"
         )
     print("=" * len(header) + "\n")
 

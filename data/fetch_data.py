@@ -104,10 +104,25 @@ def add_indicators(
     return df
 
 
+def compute_turbulence(df: pd.DataFrame, lookback: int = 63) -> pd.Series:
+    """Compute turbulence as z-score of rolling volatility.
+
+    Uses a 63-day (quarterly) rolling window for volatility estimation,
+    then z-scores against the expanding mean/std of that rolling vol.
+    """
+    daily_returns = df["close"].pct_change()
+    rolling_vol = daily_returns.rolling(window=lookback).std()
+    expanding_mean = rolling_vol.expanding().mean()
+    expanding_std = rolling_vol.expanding().std()
+    turbulence = (rolling_vol - expanding_mean) / expanding_std.replace(0, np.nan)
+    return turbulence.fillna(0.0)
+
+
 def compute_features(df: pd.DataFrame, window_size: int) -> dict:
     """Produce feature arrays from indicator DataFrame (no clipping).
 
-    Returns dict with keys: close_prices, pct_changes, sma_ratios, rsi_norm, fng_norm, buy_pressure, dates.
+    Returns dict with keys: close_prices, pct_changes, sma_ratios, rsi_norm, fng_norm,
+    buy_pressure, turbulence, dates.
     Clipping is deferred to after train/val/test split so stats come from train only.
     """
     df = df.copy()
@@ -130,6 +145,9 @@ def compute_features(df: pd.DataFrame, window_size: int) -> dict:
     else:
         df["buy_pressure"] = 0.5
 
+    # Turbulence: z-score of rolling volatility
+    df["turbulence"] = compute_turbulence(df)
+
     # Drop rows with NaN (from indicators + pct_change)
     df = df.dropna()
 
@@ -144,8 +162,12 @@ def compute_features(df: pd.DataFrame, window_size: int) -> dict:
         "rsi_norm": df["rsi_norm"].values.astype(np.float32),
         "fng_norm": df["fng_norm"].values.astype(np.float32),
         "buy_pressure": df["buy_pressure"].values.astype(np.float32),
+        "turbulence": df["turbulence"].values.astype(np.float32),
         "dates": df.index.strftime("%Y-%m-%d").values,
     }
+
+
+CLIPPED_FEATURES = ["pct_changes", "sma_ratios", "rsi_norm", "fng_norm", "buy_pressure", "turbulence"]
 
 
 def compute_clip_stats(split: dict) -> dict:
@@ -154,21 +176,26 @@ def compute_clip_stats(split: dict) -> dict:
     Returns dict mapping feature name to (mean, std).
     """
     stats = {}
-    for col in ["pct_changes", "sma_ratios", "rsi_norm", "fng_norm", "buy_pressure"]:
-        mean = float(np.mean(split[col]))
-        std = float(np.std(split[col]))
-        stats[col] = (mean, std)
+    for col in CLIPPED_FEATURES:
+        if col in split:
+            mean = float(np.mean(split[col]))
+            std = float(np.std(split[col]))
+            stats[col] = (mean, std)
     return stats
 
 
 def apply_clip(split: dict, clip_stats: dict) -> dict:
     """Clip features to ±5 std devs using pre-computed stats."""
     split = {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in split.items()}
-    for col in ["pct_changes", "sma_ratios", "rsi_norm", "fng_norm", "buy_pressure"]:
-        mean, std = clip_stats[col]
-        if std > 0:
-            split[col] = np.clip(split[col], mean - 5 * std, mean + 5 * std)
+    for col in CLIPPED_FEATURES:
+        if col in clip_stats and col in split:
+            mean, std = clip_stats[col]
+            if std > 0:
+                split[col] = np.clip(split[col], mean - 5 * std, mean + 5 * std)
     return split
+
+
+FEATURE_KEYS = ["close_prices", "pct_changes", "sma_ratios", "rsi_norm", "fng_norm", "buy_pressure", "turbulence", "dates"]
 
 
 def split_data(
@@ -180,15 +207,7 @@ def split_data(
     test_mask = dates >= val_end
 
     def select(mask):
-        return {
-            "close_prices": features["close_prices"][mask],
-            "pct_changes": features["pct_changes"][mask],
-            "sma_ratios": features["sma_ratios"][mask],
-            "rsi_norm": features["rsi_norm"][mask],
-            "fng_norm": features["fng_norm"][mask],
-            "buy_pressure": features["buy_pressure"][mask],
-            "dates": features["dates"][mask],
-        }
+        return {k: features[k][mask] for k in FEATURE_KEYS if k in features}
 
     return select(train_mask), select(val_mask), select(test_mask)
 
@@ -240,11 +259,17 @@ def main(config_path: str = "configs/default.yaml"):
     save_dir = data_cfg["save_dir"]
     os.makedirs(save_dir, exist_ok=True)
 
+    # Compute turbulence threshold (90th percentile of training data)
+    turb_threshold_pct = config.get("env", {}).get("turbulence_threshold_pct", 90)
+    turb_threshold = float(np.percentile(train["turbulence"], turb_threshold_pct))
+    print(f"  Turbulence threshold ({turb_threshold_pct}th pct of train): {turb_threshold:.4f}")
+
     # Save clip stats in train.npz for reproducibility
     train_extra = dict(train)
     for col, (mean, std) in clip_stats.items():
         train_extra[f"clip_{col}_mean"] = np.float32(mean)
         train_extra[f"clip_{col}_std"] = np.float32(std)
+    train_extra["turbulence_threshold"] = np.float32(turb_threshold)
 
     for name, split in [("train", train_extra), ("val", val), ("test", test)]:
         path = os.path.join(save_dir, f"{name}.npz")
