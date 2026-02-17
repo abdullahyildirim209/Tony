@@ -412,3 +412,54 @@ All experiments and methods tried throughout the Tony project, organized chronol
 - **Conclusion:** Network size is not the bottleneck. The [128,128] architecture in 15B is already sufficient for the 38-dim observation space. Doubling to [256,256] adds ~3x parameters without proportional signal, leading to overfitting. **Reverted to [128,128].**
 
 - **Next steps per failure plan:** Try exploration tuning (epsilon schedule) or more walk-forward folds
+
+---
+
+## 17. Multi-Asset Generalization Test (ETH, SOL) — Feb 17
+
+- **Hypothesis:** BTC-trained DQN (15B config: [128,128], 1.5M steps, trade penalty 0.0005) may generalize to other crypto assets without retraining.
+- **Method:** Apply BTC-trained models from 5 walk-forward folds to ETH-USD and SOL-USD test periods. BTC clip stats and turbulence thresholds used for all assets (model expects BTC-scale inputs).
+- **Design decisions:**
+  1. BTC clip stats for all assets — model trained with BTC-scale inputs, ETH/SOL clipped to same range
+  2. Same FNG for all — Fear & Greed Index measures overall crypto sentiment
+  3. buy_pressure = 0.5 for all — yfinance lacks taker_buy_volume (consistent with walk-forward)
+  4. SOL starts ~2020 — folds with insufficient SOL data are skipped
+- **Script:** `experiments/multi_asset_generalization.py`
+- **Results:** `results/multi_asset_generalization/`
+
+| Asset   | Fold   | Return  | Sharpe | Trades | Notes |
+|---------|--------|---------|--------|--------|-------|
+| BTC-USD | fold_1 | -4.39%  | 0.102  | 112    | Bear market; beat B&H (-50.61%) |
+| ETH-USD | fold_1 | -21.90% | -0.193 | 112    | Worse than BTC, same trade count |
+| SOL-USD | fold_1 | -52.92% | -5.841 | 13     | Collapsed; near B&H (-50.22%) |
+| BTC-USD | fold_2 | +21.03% | 0.764  | 13     | Underperformed B&H (+48.55%) |
+| ETH-USD | fold_2 | +17.91% | 0.600  | 39     | Reasonable transfer, beat B&H barely |
+| SOL-USD | fold_2 | -57.29% | -8.077 | 1      | Pure B&H collapse |
+| BTC-USD | fold_3 | +45.13% | 1.365  | 3      | Near B&H (+50.30%) |
+| ETH-USD | fold_3 | +24.41% | 0.813  | 1      | Pure B&H, half BTC return |
+| SOL-USD | fold_3 | +377.18%| 2.513  | 3      | Massive SOL rally; B&H was +361% |
+| BTC-USD | fold_4 | +11.64% | 0.793  | 30     | Active trading, B&H was +80.62% |
+| ETH-USD | fold_4 | -18.71% | -1.182 | 32     | **Failed** — active trading lost money |
+| SOL-USD | fold_4 | -22.96% | -0.333 | 46     | **Failed** — B&H was +279.93% |
+| BTC-USD | fold_5 | +21.27% | 0.920  | 122    | Most active fold |
+| ETH-USD | fold_5 | -4.35%  | 0.056  | 114    | Active but near-zero return |
+| SOL-USD | fold_5 | -10.96% | -0.127 | 94     | Active but negative |
+
+**Cross-fold averages:**
+
+| Asset   | Folds | Avg Return | Avg Sharpe | Std Sharpe | Avg Trades |
+|---------|-------|------------|------------|------------|------------|
+| BTC-USD | 5     | +18.93%    | 0.789      | 0.405      | 56.0       |
+| ETH-USD | 5     | -0.53%     | 0.019      | 0.701      | 59.6       |
+| SOL-USD | 5     | +46.61%    | -2.373     | 3.940      | 31.4       |
+
+- **Verdict: PARTIAL TRANSFER — model generalizes structure (trade count) but not profitability.**
+
+- **Analysis:**
+  1. **BTC (control):** Avg Sharpe 0.789 matches Exp 15B — confirms reproducibility
+  2. **ETH: near-zero transfer** — Avg Sharpe 0.019 (vs BTC 0.789). Trade counts similar (59.6 vs 56.0), meaning the model applies similar action patterns, but they don't profit on ETH. ETH's different volatility regime makes BTC-calibrated signals unprofitable.
+  3. **SOL: noise, not transfer** — Avg Sharpe -2.373 with massive std (3.940). fold_3 got +377% (SOL's 2023 rally), fold_2 got -57%. The model doesn't understand SOL dynamics; results are driven by underlying asset direction, not learned patterns.
+  4. **Trade counts transfer** — BTC-trained action patterns activate similarly on ETH (59.6 vs 56.0 trades). SOL has fewer trades (31.4) due to BTC clip stats compressing SOL's wilder swings.
+  5. **Bear market (fold_1/2):** Model preserved capital on BTC but failed on SOL. ETH was in between.
+  6. **Bull market (fold_3/4/5):** Model captured some ETH upside in fold_2/3 but missed SOL rallies in fold_4.
+  7. **Key insight:** The DQN learned BTC-specific patterns (mean-reversion timing, volatility regimes) that don't transfer to assets with different microstructure. Cross-asset generalization would require retraining on each asset or using asset-agnostic features.
