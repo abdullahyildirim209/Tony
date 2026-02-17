@@ -1,4 +1,4 @@
-"""Paper trading orchestrator: runs PPO model against live or historical data."""
+"""Paper trading orchestrator: runs RL model (DQN/PPO/A2C) against live or historical data."""
 
 from __future__ import annotations
 
@@ -8,9 +8,11 @@ import os
 import time
 
 import numpy as np
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, A2C, DQN
 
 from live.data_feed import BinanceLiveFeed, HistoricalReplayFeed
+
+ALGO_MAP = {"PPO": PPO, "A2C": A2C, "DQN": DQN}
 from live.feature_engine import FeatureEngine
 from live.state_manager import StateManager
 
@@ -27,7 +29,7 @@ class PaperTrader:
         log_dir: str = "live/logs",
         testnet_executor=None,
     ):
-        self.model = PPO.load(model_path)
+        self.model = self._load_model(model_path)
         self.config = config
         self.feed = feed
         self.log_dir = log_dir
@@ -50,9 +52,24 @@ class PaperTrader:
             max_drawdown_threshold=env_cfg["max_drawdown_threshold"],
         )
 
+        # Read trade penalty from config (same as env uses)
+        self.state_manager.trade_penalty = env_cfg.get("trade_penalty", 0.0005)
+
         os.makedirs(log_dir, exist_ok=True)
         self._step_log: list[dict] = []
         self._csv_path = os.path.join(log_dir, "paper_trading.csv")
+
+    @staticmethod
+    def _load_model(model_path: str):
+        """Auto-detect algorithm type and load the model."""
+        for name, cls in ALGO_MAP.items():
+            try:
+                model = cls.load(model_path)
+                print(f"  Loaded {name} model from {model_path}")
+                return model
+            except Exception:
+                continue
+        raise ValueError(f"Could not load model from {model_path} with any of {list(ALGO_MAP.keys())}")
 
     def warmup(self, historical_bars: list[dict]) -> None:
         """Feed historical bars to build indicator buffers before trading starts."""

@@ -19,6 +19,7 @@ class StateManager:
         self.initial_cash = initial_cash
         self.transaction_cost = transaction_cost
         self.max_drawdown_threshold = max_drawdown_threshold
+        self.trade_penalty = 0.0005  # default, overridden by PaperTrader from config
 
         self.cash = initial_cash
         self.shares = 0.0
@@ -86,7 +87,7 @@ class StateManager:
             reward = float(np.log(portfolio_value / prev_portfolio))
         else:
             reward = 0.0
-        reward -= 0.001 * float(trade_executed)
+        reward -= self.trade_penalty * float(trade_executed)
 
         # Termination: max drawdown
         terminated = False
@@ -159,6 +160,7 @@ class StateManager:
             "win_count": self.win_count,
             "loss_count": self.loss_count,
             "trade_count": self.trade_count,
+            "trade_penalty": self.trade_penalty,
         }
 
     @classmethod
@@ -180,4 +182,5 @@ class StateManager:
         sm.win_count = d["win_count"]
         sm.loss_count = d["loss_count"]
         sm.trade_count = d["trade_count"]
+        sm.trade_penalty = d.get("trade_penalty", 0.0005)
         return sm

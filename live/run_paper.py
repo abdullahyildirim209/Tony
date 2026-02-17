@@ -135,25 +135,12 @@ def main():
         if args.resume:
             trader.load_state(args.resume)
         else:
-            # Warmup from train data
+            # Warmup from Binance live historical bars (real OHLCV, not stale train data)
             warmup_days = live_cfg.get("warmup_days", 60)
-            train_data = np.load(train_npz_path, allow_pickle=True)
-            train_closes = train_data["close_prices"]
-            train_dates = train_data["dates"]
-            train_fng = train_data["fng_norm"] * 100
-
-            warmup_bars = []
-            start = max(0, len(train_closes) - warmup_days)
-            for i in range(start, len(train_closes)):
-                warmup_bars.append({
-                    "date": str(train_dates[i]),
-                    "open": float(train_closes[i]),
-                    "high": float(train_closes[i]),
-                    "low": float(train_closes[i]),
-                    "close": float(train_closes[i]),
-                    "volume": 0.0,
-                    "fng": float(train_fng[i]),
-                })
+            print(f"  Fetching {warmup_days} warmup bars from Binance...")
+            warmup_bars = feed.fetch_historical_bars(limit=warmup_days)
+            if len(warmup_bars) < warmup_days:
+                print(f"  WARNING: Only got {len(warmup_bars)}/{warmup_days} warmup bars from Binance")
             trader.warmup(warmup_bars)
 
         check_interval = live_cfg.get("check_interval_hours", 1)

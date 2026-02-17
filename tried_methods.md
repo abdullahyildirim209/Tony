@@ -367,3 +367,48 @@ All experiments and methods tried throughout the Tony project, organized chronol
   6. **Mean P&L per trade lower** (7.65% → 1.09%) — expected: more trades = smaller per-trade gains, but total return actually improved (237% → 261%)
   7. **Skew positive** (2.983 vs -1.338 in 15A) — healthy: right tail dominates, a few big winners
   8. **fold_1 (bear market):** Only 8 trades, +0.25% vs B&H -50.61% — excellent capital preservation
+
+---
+
+## 16. DQN Network Architecture [128,128] → [256,256] — Feb 17
+
+- **Hypothesis:** Larger network (256x256 vs 128x128) may capture more complex patterns with 38-dim observation space and 1.5M training steps.
+- **Change:** `configs/default.yaml` line 43-44: `net_arch: [128, 128]` → `[256, 256]`
+- **Everything else identical to 15B:** DQN-only, 1.5M steps, trade penalty 0.0005
+
+**Results:**
+
+| Metric | Exp 15B | **Exp 16** | Target | Verdict |
+|--------|---------|------------|--------|---------|
+| Trades | 96 | **139** | 50-150 | PASS |
+| Sharpe | 1.054 | **0.705** | > 1.0 | **FAIL** |
+| Sharpe CI lower | 0.151 | **-0.198** | > 0 | **FAIL** |
+| t-test p | 0.131 | **0.166** | < 0.10 | **FAIL** |
+| Mean P&L | +1.09% | **+0.59%** | — | worse |
+| Mean hold | 4.7 | **2.6** | — | shorter |
+| Total return | 260.69% | **127.34%** | — | -51% |
+
+**Per-fold breakdown:**
+
+| Fold | Return | Sharpe | Trades | Notes |
+|------|--------|--------|--------|-------|
+| fold_1 | -4.39% | 0.102 | 112 | Bear market; survived (B&H: -50.61%) but worse than 15B (+0.25%) |
+| fold_2 | +21.03% | 0.764 | 13 | Underperformed B&H (+48.55%) and 15B (+58.14%) |
+| fold_3 | +45.13% | 1.365 | 3 | Near B&H (+50.30%), similar to 15B (+43.97%) |
+| fold_4 | +11.64% | 0.793 | 30 | Underperformed B&H (+80.62%) and 15B (+39.97%) |
+| fold_5 | +21.27% | 0.920 | 122 | Underperformed B&H (+60.22%) and 15B (+12.89%) |
+
+- **Verdict: FAIL. Larger network hurt performance across all key metrics.**
+
+- **Analysis:**
+  1. **Sharpe dropped significantly** (1.054 → 0.705, -33%) — larger network is overfitting or learning noisier patterns
+  2. **Sharpe CI lower bound turned negative** (0.151 → -0.198) — lost the key milestone from 15A/15B where CI excluded zero
+  3. **t-test p worsened** (0.131 → 0.166) — despite more trades (139 vs 96), lower per-trade quality offsets the statistical power gain
+  4. **Trades increased** (96 → 139) but quality dropped — mean P&L +1.09% → +0.59%, mean hold 4.7 → 2.6 steps — larger network reverted toward rapid-fire low-quality trades
+  5. **fold_1 regressed** (+0.25% → -4.39%) — larger network couldn't preserve capital as well in the bear market
+  6. **fold_2 regressed** (+58.14% → +21.03%) — biggest single-fold drop
+  7. **Total return halved** (260.69% → 127.34%) — strictly worse
+
+- **Conclusion:** Network size is not the bottleneck. The [128,128] architecture in 15B is already sufficient for the 38-dim observation space. Doubling to [256,256] adds ~3x parameters without proportional signal, leading to overfitting. **Reverted to [128,128].**
+
+- **Next steps per failure plan:** Try exploration tuning (epsilon schedule) or more walk-forward folds
