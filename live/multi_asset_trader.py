@@ -337,6 +337,67 @@ class MultiAssetTrader:
 
         return stats
 
+    def _load_states(self) -> int:
+        """Load saved state for all traders. Returns count of restored traders."""
+        restored = 0
+        for asset_id, trader in self.traders.items():
+            state_path = os.path.join(self.state_dir, f"{asset_id}.json")
+            if os.path.exists(state_path):
+                trader.load_state(state_path)
+                restored += 1
+        return restored
+
+    def run_once(self) -> dict:
+        """Execute one daily cycle for all assets, then exit.
+
+        Suitable for cron: initializes, resumes state or warms up,
+        steps once, saves state, prints summary.
+        """
+        import datetime
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        print(f"\n=== Multi-Asset Daily Cycle: {now_utc} ===")
+
+        # Resume from saved state or warmup
+        restored = self._load_states()
+        if restored > 0:
+            print(f"  Resumed {restored}/{len(self.traders)} asset(s) from saved state")
+            # Warmup any that weren't restored
+            warmup_needed = [a for a in self.traders if not os.path.exists(
+                os.path.join(self.state_dir, f"{a}.json"))]
+            if warmup_needed:
+                print(f"  Warming up {len(warmup_needed)} new asset(s)...")
+                for asset_id in warmup_needed:
+                    warmup_bars = self.traders[asset_id].feed.fetch_historical_bars(
+                        limit=self.default_config.get("live", {}).get("warmup_days", 60))
+                    self.traders[asset_id].warmup(warmup_bars)
+        else:
+            print("  No saved state — warming up all assets from Binance...")
+            self.warmup_live()
+
+        # Execute one step
+        results = self.daily_step()
+        any_new = any(r is not None for r in results.values())
+
+        if any_new:
+            stats = self.get_aggregate_stats()
+            self._print_summary(stats)
+            self._save_summary(stats)
+            self._save_states()
+            self._write_combined_log(results)
+
+            # Check total drawdown
+            max_total_dd = self.pt_config.get("risk", {}).get("max_drawdown_total", 0.30)
+            if stats["combined_return"] < -max_total_dd:
+                print(f"  EMERGENCY: Total drawdown {stats['combined_return']:.1%} "
+                      f"exceeds limit {-max_total_dd:.1%}.")
+        else:
+            print("  No new bars available (already processed today)")
+            stats = self.get_aggregate_stats()
+
+        print("  Done.\n")
+        return stats
+
     def run_live(self) -> None:
         """Live paper trading loop: check for new daily bars periodically."""
         schedule_cfg = self.pt_config.get("schedule", {})

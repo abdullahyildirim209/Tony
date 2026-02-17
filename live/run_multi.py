@@ -2,7 +2,8 @@
 
 Usage:
     python live/run_multi.py --mode replay   # test all assets against historical data
-    python live/run_multi.py --mode live     # real-time multi-asset paper trading
+    python live/run_multi.py --mode live     # real-time multi-asset paper trading (loop)
+    python live/run_multi.py --mode once     # single daily cycle (for cron/daily.sh)
 """
 
 import argparse
@@ -16,8 +17,8 @@ from live.multi_asset_trader import MultiAssetTrader
 
 def main():
     parser = argparse.ArgumentParser(description="Tony Multi-Asset Paper Trader")
-    parser.add_argument("--mode", choices=["replay", "live"], default="replay",
-                        help="Trading mode: replay (historical) or live (Binance)")
+    parser.add_argument("--mode", choices=["replay", "live", "once"], default="replay",
+                        help="Trading mode: replay (historical), live (loop), once (single cycle)")
     parser.add_argument("--config", default="configs/paper_trading.yaml",
                         help="Path to multi-asset paper trading config")
     parser.add_argument("--default-config", default="configs/default.yaml",
@@ -34,6 +35,9 @@ def main():
     elif args.mode == "live":
         trader.initialize_traders(mode="live")
         trader.run_live()
+    elif args.mode == "once":
+        trader.initialize_traders(mode="live")
+        trader.run_once()
 
 
 if __name__ == "__main__":
