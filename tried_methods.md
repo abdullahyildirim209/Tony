@@ -615,3 +615,53 @@ All experiments and methods tried throughout the Tony project, organized chronol
 3. **ADAUSDT paradox:** Flagged unhealthy (fold_5 Sortino -4.32) but returned +35.67% in replay. This means the filter is occasionally conservative — but better safe than sorry with $125 vs $1,356 at risk.
 4. **4 healthy assets carry the portfolio:** BTC ($2,733), ETH ($3,129), BNB ($2,803), DOT ($3,119) — all positive returns.
 5. **BTCUSDT only statistically significant asset** (t-test p=0.041) — the only one where we can reject H0 that returns > 0 at 5% significance level.
+
+---
+
+## 19. Multi-Asset Daily Mode (Live Cron Pipeline) — Feb 17
+
+- **Problem:** `daily.sh` used the old single-asset `run_daily.py` with hardcoded model path `models/walk_forward/fold_5/best_model`. Needed to switch to multi-asset pipeline with performance filter.
+
+### Changes
+
+#### `live/multi_asset_trader.py` — added `run_once()` and `_load_states()`
+- **`_load_states()`**: Loads saved JSON state for all traders from `paper_trading_logs/state/{ASSET}.json`
+- **`run_once()`**: Cron-friendly single daily cycle:
+  1. Resumes from saved state (or warms up from Binance on first run)
+  2. Calls `daily_step()` once for all 8 assets
+  3. Prints summary, saves state + summary JSON + combined CSV log
+  4. Checks total drawdown limit (30%)
+  5. Exits
+
+#### `live/run_multi.py` — added `--mode once`
+- New mode alongside `replay` and `live`
+- `--mode once`: calls `initialize_traders(mode="live")` then `run_once()`
+- `--mode live`: continuous loop (unchanged)
+- `--mode replay`: historical test (unchanged)
+
+#### `daily.sh` — updated to multi-asset
+```bash
+#!/bin/bash
+cd "$(dirname "$0")"
+export $(cat .env | xargs)
+.venv/bin/python live/run_multi.py --mode once >> paper_trading_logs/daily.log 2>&1
+```
+
+### Verification
+
+Ran 3 consecutive `--mode once` cycles:
+1. **First run:** Warmed up all 8 assets from 60 Binance bars, processed 2026-02-16, DOT and ATOM made buy trades. State saved to `paper_trading_logs/state/*.json`
+2. **Second run:** Resumed 8/8 from saved state (step 1→2). BTC, ETH, ADA bought. DOT sold.
+3. **Third run:** Resumed 8/8 from state (step 2→3). ADA sold. Positions stable.
+
+All 3 runs correctly:
+- Loaded performance filter (4 unhealthy assets at $125 floor)
+- Applied win-rate-weighted allocation to healthy assets
+- Resumed from saved state without re-warming up
+- Saved updated state after each cycle
+
+### Cron Setup
+```
+5 0 * * * /path/to/tony/daily.sh
+```
+Runs at 00:05 UTC daily (after Binance daily candle close at 00:00 UTC).

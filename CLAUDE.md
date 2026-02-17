@@ -44,6 +44,12 @@ python experiments/statistical_analysis.py
 python live/run_paper.py --mode replay    # test against historical data
 python live/run_paper.py --mode live      # real-time paper trading via Binance
 python live/run_paper.py --mode live --resume live/state/latest.json  # resume after crash
+
+# 6. Multi-asset paper trading (8 assets with performance filter)
+python live/run_multi.py --mode replay    # historical replay with walk-forward test data
+python live/run_multi.py --mode once      # single daily cycle (for cron/daily.sh)
+python live/run_multi.py --mode live      # continuous live loop
+./daily.sh                                # cron wrapper: loads .env, runs --mode once, logs output
 ```
 
 Config override: pass a YAML path as the first argument, e.g. `python agent/train.py configs/custom.yaml`.
