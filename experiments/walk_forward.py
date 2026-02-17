@@ -413,6 +413,20 @@ def main(config_path: str = "configs/default.yaml", symbol: str = None):
         print_regime_table(fold_results)
         generate_plots(fold_results, f"results/{asset}/walk_forward")
 
+        # Save per-fold agent metrics to JSON for downstream allocation
+        import json
+        metrics_out = {}
+        for fold_name, results in fold_results.items():
+            agent_metrics = next((r["metrics"] for r in results if r["name"] == "PPO Agent"), None)
+            if agent_metrics:
+                metrics_out[fold_name] = {
+                    k: float(v) if isinstance(v, (int, float, np.floating, np.integer)) else v
+                    for k, v in agent_metrics.items()
+                }
+        metrics_path = f"results/{asset}/walk_forward/fold_metrics.json"
+        with open(metrics_path, "w") as f:
+            json.dump(metrics_out, f, indent=2, default=str)
+
     print(f"\nWalk-forward testing complete for {asset}.")
 
 

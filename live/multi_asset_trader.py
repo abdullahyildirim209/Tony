@@ -42,6 +42,65 @@ class MultiAssetTrader:
         self.asset_configs: dict[str, dict] = {}
         self._disabled_assets: set[str] = set()
 
+    def _compute_allocations(self, total_capital: float) -> dict[str, float]:
+        """Compute per-asset capital allocation weighted by walk-forward win rate.
+
+        Loads fold_metrics.json for each asset, averages win_rate across folds,
+        then allocates proportionally. Assets without metrics get equal share of
+        a 10% floor pool; the rest is split by win rate.
+        """
+        alloc_cfg = self.pt_config.get("allocation", {})
+        method = alloc_cfg.get("method", "equal")
+
+        enabled_tickers = [
+            a.get("yf_ticker", a["ticker"])
+            for a in self.pt_config["assets"]
+            if a.get("enabled", True)
+        ]
+
+        if method == "equal" or len(enabled_tickers) == 0:
+            per = total_capital / max(len(enabled_tickers), 1)
+            return {t: per for t in enabled_tickers}
+
+        # Load win rates from walk-forward results
+        win_rates: dict[str, float] = {}
+        for ticker in enabled_tickers:
+            metrics_path = f"results/{ticker}/walk_forward/fold_metrics.json"
+            if os.path.exists(metrics_path):
+                with open(metrics_path) as f:
+                    fold_metrics = json.load(f)
+                rates = [m["win_rate"] for m in fold_metrics.values() if "win_rate" in m]
+                win_rates[ticker] = np.mean(rates) if rates else 0.0
+            else:
+                win_rates[ticker] = 0.0
+
+        # Floor: every asset gets at least floor_pct of equal share
+        floor_pct = alloc_cfg.get("floor_pct", 0.10)
+        equal_share = total_capital / len(enabled_tickers)
+        floor_amount = equal_share * floor_pct
+
+        remaining = total_capital - floor_amount * len(enabled_tickers)
+
+        # Weight by win rate (clip negatives to 0)
+        clipped = {t: max(wr, 0.0) for t, wr in win_rates.items()}
+        total_wr = sum(clipped.values())
+
+        allocations = {}
+        if total_wr > 0:
+            for t in enabled_tickers:
+                allocations[t] = floor_amount + remaining * (clipped[t] / total_wr)
+        else:
+            # All zero win rates — fall back to equal
+            for t in enabled_tickers:
+                allocations[t] = total_capital / len(enabled_tickers)
+
+        print("  Capital allocation (win-rate weighted):")
+        for t in enabled_tickers:
+            wr_str = f"{win_rates[t]:.1%}" if t in win_rates else "N/A"
+            print(f"    {t:<12} win_rate={wr_str:>6}  capital=${allocations[t]:>10,.2f}")
+
+        return allocations
+
     def initialize_traders(self, mode: str = "live") -> None:
         """Create PaperTrader instances for each enabled asset.
 
@@ -49,7 +108,8 @@ class MultiAssetTrader:
             mode: "live" or "replay". Determines the feed type.
         """
         risk_cfg = self.pt_config.get("risk", {})
-        capital_per_asset = risk_cfg.get("capital_per_asset", 2000)
+        total_capital = risk_cfg.get("total_capital", 10000)
+        allocations = self._compute_allocations(total_capital)
 
         for asset_cfg in self.pt_config["assets"]:
             if not asset_cfg.get("enabled", True):
@@ -70,10 +130,11 @@ class MultiAssetTrader:
                 print(f"  SKIP {asset_id}: train.npz not found at {train_npz_path}")
                 continue
 
-            # Build per-asset config (override capital)
+            # Build per-asset config (override capital with allocation)
+            asset_capital = allocations.get(asset_id, total_capital / 8)
             asset_config = dict(self.default_config)
             asset_config["env"] = dict(self.default_config["env"])
-            asset_config["env"]["initial_cash"] = capital_per_asset
+            asset_config["env"]["initial_cash"] = asset_capital
             asset_config["data"] = dict(self.default_config["data"])
             asset_config["data"]["binance_symbol"] = ticker
             asset_config["data"]["asset"] = asset_id
@@ -172,7 +233,8 @@ class MultiAssetTrader:
         print("\n=== Multi-Asset Paper Trading: Historical Replay ===")
 
         risk_cfg = self.pt_config.get("risk", {})
-        capital_per_asset = risk_cfg.get("capital_per_asset", 2000)
+        total_capital = risk_cfg.get("total_capital", 10000)
+        allocations = self._compute_allocations(total_capital)
         warmup_days = self.default_config.get("live", {}).get("warmup_days", 60)
 
         for asset_cfg in self.pt_config["assets"]:
@@ -198,10 +260,11 @@ class MultiAssetTrader:
                 print(f"  SKIP {asset_id}: model not found at {model_path}")
                 continue
 
-            # Build per-asset config
+            # Build per-asset config with win-rate-weighted capital
+            asset_capital = allocations.get(asset_id, total_capital / 8)
             asset_config = dict(self.default_config)
             asset_config["env"] = dict(self.default_config["env"])
-            asset_config["env"]["initial_cash"] = capital_per_asset
+            asset_config["env"]["initial_cash"] = asset_capital
             asset_config["data"] = dict(self.default_config["data"])
             asset_config["data"]["binance_symbol"] = asset_cfg["ticker"]
             asset_config["data"]["asset"] = asset_id

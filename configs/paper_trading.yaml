@@ -51,7 +51,11 @@ schedule:
 risk:
   max_drawdown_per_asset: 0.50
   max_drawdown_total: 0.30
-  capital_per_asset: 1250  # $10k total / 8 assets
+  total_capital: 10000
+
+allocation:
+  method: "win_rate_weighted"  # "equal" or "win_rate_weighted"
+  floor_pct: 0.10             # every asset gets at least 10% of equal share
 
 logging:
   log_dir: "paper_trading_logs"
