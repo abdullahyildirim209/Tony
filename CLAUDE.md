@@ -108,7 +108,7 @@ The initial implementation drew patterns from these open-source projects:
 
 19. **Lower transaction cost** (`configs/default.yaml`, `env/trading_env.py`) - Reduced `transaction_cost` from 0.001 (10bps) to 0.0004 (4bps) to match Binance futures taker fees. Reduced reward trade penalty from 0.0005 to 0.0002 proportionally. Encourages more active trading on volatile altcoins.
 
-20. **Performance filter in allocation** (`live/multi_asset_trader.py`) - Assets with avg Sortino < -1.0 AND < 40% positive folds across walk-forward are flagged "unhealthy" and receive only floor allocation. Saved capital is redistributed to healthy assets proportionally by win rate.
+20. **Performance filter in allocation** (`live/multi_asset_trader.py`) - Assets flagged "unhealthy" receive only floor allocation ($125). Two criteria: (1) avg Sortino < -1.0 AND < 40% positive folds, OR (2) latest deployment fold Sortino < -2.0. Saved capital is redistributed to healthy assets proportionally by win rate. Currently flags 4/8 assets (ADA, DOGE, AVAX, ATOM).
 
 ## Key Architectural Decisions
 

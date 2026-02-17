@@ -559,3 +559,59 @@ All experiments and methods tried throughout the Tony project, organized chronol
 
 - **Key insight:** When an asset's deployment fold has terrible Sortino (< -2.0), the model cannot trade that regime profitably regardless of cross-fold average. The tightened filter catches this by checking the latest fold specifically, since that's the fold whose model gets deployed.
 - **Lesson:** Cross-fold averages can mask deployment-fold weakness. A model with good avg Sortino but terrible latest-fold Sortino is still dangerous in production. Always check the deployment fold independently.
+
+---
+
+## 18B. Full 8-Asset Retrain (with clipped bonus + lower tx cost) — Feb 17
+
+- **Context:** After Exp 18 fixed DOGE/ATOM, retrained all 6 remaining assets (BTC, ETH, BNB, ADA, DOT, AVAX) with the same config changes (clipped terminal bonus, 4bps transaction cost).
+
+### Walk-Forward Cross-Fold Results (all 8 assets)
+
+| Asset | Avg Return | Avg Sharpe | Trades | Mean P&L | t-test p | Notable |
+|-------|-----------|-----------|--------|----------|----------|---------|
+| BTCUSDT | +14.96% | -0.130 | 69 | +1.76% | **0.041*** | Statistically significant |
+| ETHUSDT | -1.46% | -0.640 | 54 | +0.38% | 0.720 | fold_1 B&H collapse hurts avg |
+| BNBUSDT | -5.03% | -0.473 | 46 | +0.34% | 0.734 | fold_1 B&H collapse |
+| ADAUSDT | -6.45% | -0.619 | 83 | -0.40% | 0.603 | fold_5 hit 50% DD |
+| DOGEUSDT | +17.62% | +0.335 | 93 | +1.44% | 0.335 | Improved from negative |
+| DOTUSDT | -3.40% | +0.209 | 120 | +0.10% | 0.883 | Beat B&H avg (-8%) |
+| AVAXUSDT | +8.43% | -0.456 | 106 | +0.52% | 0.650 | High variance |
+| ATOMUSDT | -12.55% | -0.301 | 158 | -0.22% | 0.722 | Improved from -28.5% |
+
+### Portfolio Replay (all retrained, with performance filter v2)
+
+- **4 assets flagged UNHEALTHY** (was 2 before full retrain):
+  - ADAUSDT (latest_fold_sortino=-4.32) — NEW, wasn't flagged before
+  - DOGEUSDT (latest_fold_sortino=-4.18)
+  - AVAXUSDT (latest_fold_sortino=-3.99) — NEW, wasn't flagged before
+  - ATOMUSDT (latest_fold_sortino=-3.76)
+
+| Asset | Capital | Return | Sharpe | Trades | Win Rate | Notes |
+|-------|---------|--------|--------|--------|----------|-------|
+| BTCUSDT | $1,839 | **+48.64%** | 1.299 | 25 | 58.3% | Best performer, doubled from +24.68% |
+| ETHUSDT | $2,404 | +30.17% | 0.813 | 24 | 66.7% | Solid |
+| BNBUSDT | $2,204 | +27.18% | 0.723 | 1 | 0.0% | Pure B&H |
+| DOTUSDT | $3,053 | +2.14% | 0.313 | 59 | 44.8% | Largest allocation, modest return |
+| ADAUSDT | $125 | +35.67% | 0.783 | 64 | 46.9% | UNHEALTHY — ironic: good return but filter correct to limit exposure |
+| DOGEUSDT | $125 | -51.86% | -3.986 | 9 | 0.0% | UNHEALTHY — hit 50% DD |
+| AVAXUSDT | $125 | -49.77% | -2.458 | 17 | 25.0% | UNHEALTHY — hit 50% DD |
+| ATOMUSDT | $125 | -51.89% | -3.373 | 7 | 0.0% | UNHEALTHY — hit 50% DD |
+| **TOTAL** | $10,000 | **+21.37%** | | 206 | | **$12,137** |
+
+### Progression
+
+| Stage | Portfolio Return | Notes |
+|-------|-----------------|-------|
+| Before any changes | +2.61% | DOGE/ATOM dragging down |
+| After DOGE/ATOM retrain + filter v1 | +2.74% | Filter didn't trigger |
+| After DOGE/ATOM retrain + filter v2 | +19.47% | 2 assets flagged unhealthy |
+| **After full 8-asset retrain + filter v2** | **+21.37%** | 4 assets flagged unhealthy |
+
+### Key Observations
+
+1. **BTC improved dramatically** (+24.68% → +48.64%) — the clipped terminal bonus and lower tx cost benefited BTC the most, with Sharpe jumping from 0.885 to 1.299
+2. **More assets flagged unhealthy is actually good** — ADAUSDT and AVAXUSDT were previously "healthy" with old models, but retraining revealed their fold_5 weakness. The filter correctly protects capital.
+3. **ADAUSDT paradox:** Flagged unhealthy (fold_5 Sortino -4.32) but returned +35.67% in replay. This means the filter is occasionally conservative — but better safe than sorry with $125 vs $1,356 at risk.
+4. **4 healthy assets carry the portfolio:** BTC ($2,733), ETH ($3,129), BNB ($2,803), DOT ($3,119) — all positive returns.
+5. **BTCUSDT only statistically significant asset** (t-test p=0.041) — the only one where we can reject H0 that returns > 0 at 5% significance level.
