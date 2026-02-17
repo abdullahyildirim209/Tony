@@ -182,10 +182,18 @@ def generate_plots(
     print(f"  Saved statistical plots -> {plots_dir}")
 
 
-def collect_walk_forward_results(config: dict):
+def collect_walk_forward_results(config: dict, asset: str = None):
     """Load walk-forward fold data and run agent on each to pool trade logs and daily returns."""
-    folds_dir = "data/walk_forward"
-    models_dir = "models/walk_forward"
+    if asset:
+        folds_dir = f"data/walk_forward/{asset}"
+        models_dir = f"models/walk_forward/{asset}"
+        # Fall back to flat layout for backward compatibility (BTC-USD legacy)
+        if not os.path.isdir(folds_dir):
+            folds_dir = "data/walk_forward"
+            models_dir = "models/walk_forward"
+    else:
+        folds_dir = "data/walk_forward"
+        models_dir = "models/walk_forward"
 
     if not os.path.isdir(folds_dir):
         return None, None, None, None
@@ -232,10 +240,17 @@ def collect_walk_forward_results(config: dict):
     )
 
 
-def main(config_path: str = "configs/default.yaml"):
+def main(config_path: str = "configs/default.yaml", symbol: str = None):
     config = load_config(config_path)
     set_seeds(config["seed"])
     rng = np.random.default_rng(config["seed"])
+
+    # Override asset/binance_symbol if symbol specified
+    if symbol is not None:
+        config["data"]["binance_symbol"] = symbol
+        config["data"]["asset"] = symbol
+
+    asset = config["data"]["asset"]
 
     stat_cfg = config.get("experiments", {}).get("statistical", {})
     n_bootstrap = stat_cfg.get("n_bootstrap", 10000)
@@ -243,11 +258,11 @@ def main(config_path: str = "configs/default.yaml"):
 
     train_cfg = config["training"]
     data_dir = config["data"]["save_dir"]
-    plots_dir = "results/statistics"
+    plots_dir = f"results/{asset}/statistics"
 
     # Try walk-forward aggregate first
-    print("Checking for walk-forward results...")
-    wf_result = collect_walk_forward_results(config)
+    print(f"Checking for walk-forward results ({asset})...")
+    wf_result = collect_walk_forward_results(config, asset=asset)
     wf_trades, wf_agent_daily, wf_bh_daily, n_folds = wf_result
 
     if wf_trades is not None and len(wf_trades) > 0:
@@ -351,5 +366,9 @@ def main(config_path: str = "configs/default.yaml"):
 
 
 if __name__ == "__main__":
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "configs/default.yaml"
-    main(config_path)
+    import argparse
+    parser = argparse.ArgumentParser(description="Statistical analysis of trading results")
+    parser.add_argument("--config", default="configs/default.yaml", help="Config YAML path")
+    parser.add_argument("--symbol", default=None, help="Binance symbol (e.g. ETHUSDT). Overrides config.")
+    args = parser.parse_args()
+    main(config_path=args.config, symbol=args.symbol)

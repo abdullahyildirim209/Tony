@@ -287,9 +287,16 @@ def generate_plots(fold_results: dict, plots_dir: str):
     print(f"  Saved walk-forward plots -> {plots_dir}")
 
 
-def main(config_path: str = "configs/default.yaml"):
+def main(config_path: str = "configs/default.yaml", symbol: str = None):
     config = load_config(config_path)
     set_seeds(config["seed"])
+
+    # Override asset/binance_symbol if symbol specified
+    if symbol is not None:
+        config["data"]["binance_symbol"] = symbol
+        config["data"]["asset"] = symbol
+
+    asset = config["data"]["asset"]
 
     exp_cfg = config["experiments"]["walk_forward"]
     folds = exp_cfg["folds"]
@@ -300,7 +307,6 @@ def main(config_path: str = "configs/default.yaml"):
     # Download full date range once
     global_start = min(f["train_start"] for f in folds)
     global_end = max(f["test_end"] for f in folds)
-    asset = config["data"]["asset"]
 
     print(f"Downloading {asset} from {global_start} to {global_end}...")
     if config["data"].get("source") == "huggingface":
@@ -360,7 +366,7 @@ def main(config_path: str = "configs/default.yaml"):
             print(f"  Turbulence threshold: {turb_threshold:.4f}")
 
         # Save fold data (include turbulence threshold)
-        data_dir = f"data/walk_forward/{name}"
+        data_dir = f"data/walk_forward/{asset}/{name}"
         os.makedirs(data_dir, exist_ok=True)
         train_extra = dict(train_split)
         if turb_threshold is not None:
@@ -369,7 +375,7 @@ def main(config_path: str = "configs/default.yaml"):
             np.savez(os.path.join(data_dir, f"{split_name}.npz"), **split_data_dict)
 
         # Train
-        model_dir = f"models/walk_forward/{name}"
+        model_dir = f"models/walk_forward/{asset}/{name}"
         ensemble_cfg = config.get("ensemble", {})
         ensemble_algos = ensemble_cfg.get("algorithms", [])
 
@@ -405,11 +411,15 @@ def main(config_path: str = "configs/default.yaml"):
     # Summary
     if fold_results:
         print_regime_table(fold_results)
-        generate_plots(fold_results, "results/walk_forward")
+        generate_plots(fold_results, f"results/{asset}/walk_forward")
 
-    print("\nWalk-forward testing complete.")
+    print(f"\nWalk-forward testing complete for {asset}.")
 
 
 if __name__ == "__main__":
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "configs/default.yaml"
-    main(config_path)
+    import argparse
+    parser = argparse.ArgumentParser(description="Walk-forward testing")
+    parser.add_argument("--config", default="configs/default.yaml", help="Config YAML path")
+    parser.add_argument("--symbol", default=None, help="Binance symbol (e.g. ETHUSDT). Overrides config.")
+    args = parser.parse_args()
+    main(config_path=args.config, symbol=args.symbol)

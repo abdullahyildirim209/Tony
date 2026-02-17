@@ -1,8 +1,8 @@
 seed: 42
 
 data:
-  asset: "BTC-USD"
-  source: "yfinance"
+  asset: "BTCUSDT"
+  source: "huggingface"
   binance_symbol: "BTCUSDT"
   hf_cache_dir: "data/hf_cache"
   start_date: "2019-01-01"
@@ -59,6 +59,8 @@ validation:
 
 ensemble:
   algorithms:
+    - "ppo"
+    - "a2c"
     - "dqn"
   algorithm_kwargs:
     ppo:

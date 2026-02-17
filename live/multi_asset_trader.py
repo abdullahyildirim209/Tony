@@ -1,0 +1,391 @@
+"""Multi-asset paper trading orchestrator.
+
+Runs independent DQN models for multiple crypto assets in parallel,
+with aggregated logging and risk management.
+
+Usage:
+    python live/run_multi.py --mode replay
+    python live/run_multi.py --mode live
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import os
+import time
+
+import numpy as np
+import yaml
+
+from live.data_feed import BinanceLiveFeed, HistoricalReplayFeed
+from live.paper_trader import PaperTrader
+
+
+def load_config(path: str) -> dict:
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
+class MultiAssetTrader:
+    """Manages multiple PaperTrader instances, one per asset."""
+
+    def __init__(self, paper_trading_config_path: str, default_config_path: str = "configs/default.yaml"):
+        self.pt_config = load_config(paper_trading_config_path)
+        self.default_config = load_config(default_config_path)
+
+        log_cfg = self.pt_config.get("logging", {})
+        self.log_dir = log_cfg.get("log_dir", "paper_trading_logs")
+        self.state_dir = log_cfg.get("state_dir", "paper_trading_logs/state")
+
+        self.traders: dict[str, PaperTrader] = {}
+        self.asset_configs: dict[str, dict] = {}
+        self._disabled_assets: set[str] = set()
+
+    def initialize_traders(self, mode: str = "live") -> None:
+        """Create PaperTrader instances for each enabled asset.
+
+        Args:
+            mode: "live" or "replay". Determines the feed type.
+        """
+        risk_cfg = self.pt_config.get("risk", {})
+        capital_per_asset = risk_cfg.get("capital_per_asset", 2000)
+
+        for asset_cfg in self.pt_config["assets"]:
+            if not asset_cfg.get("enabled", True):
+                continue
+
+            ticker = asset_cfg["ticker"]  # Binance symbol (e.g. BTCUSDT)
+            asset_id = asset_cfg.get("yf_ticker", ticker)  # asset identifier for paths/logs
+            model_path = asset_cfg["model_path"]
+            train_npz_path = asset_cfg["train_npz_path"]
+
+            if not os.path.exists(model_path + ".zip") and not os.path.exists(model_path):
+                # Try without .zip extension
+                if not os.path.exists(model_path):
+                    print(f"  SKIP {asset_id}: model not found at {model_path}")
+                    continue
+
+            if not os.path.exists(train_npz_path):
+                print(f"  SKIP {asset_id}: train.npz not found at {train_npz_path}")
+                continue
+
+            # Build per-asset config (override capital)
+            asset_config = dict(self.default_config)
+            asset_config["env"] = dict(self.default_config["env"])
+            asset_config["env"]["initial_cash"] = capital_per_asset
+            asset_config["data"] = dict(self.default_config["data"])
+            asset_config["data"]["binance_symbol"] = ticker
+            asset_config["data"]["asset"] = asset_id
+
+            asset_log_dir = os.path.join(self.log_dir, asset_id)
+
+            if mode == "live":
+                feed = BinanceLiveFeed(symbol=ticker)
+            else:
+                feed = None  # Set up in run_replay per asset
+
+            if feed is not None:
+                trader = PaperTrader(
+                    model_path=model_path,
+                    train_npz_path=train_npz_path,
+                    config=asset_config,
+                    feed=feed,
+                    log_dir=asset_log_dir,
+                )
+                self.traders[asset_id] = trader
+                self.asset_configs[asset_id] = asset_cfg
+
+            elif mode == "replay":
+                # Store config for replay setup later
+                self.asset_configs[asset_id] = asset_cfg
+                self.asset_configs[asset_id]["_asset_config"] = asset_config
+                self.asset_configs[asset_id]["_log_dir"] = asset_log_dir
+
+        print(f"  Initialized {len(self.traders) or len(self.asset_configs)} asset(s)")
+
+    def warmup_live(self) -> None:
+        """Fetch and feed warmup bars from Binance for all live traders."""
+        warmup_days = self.default_config.get("live", {}).get("warmup_days", 60)
+
+        for asset_id, trader in self.traders.items():
+            print(f"  Warming up {asset_id}...")
+            warmup_bars = trader.feed.fetch_historical_bars(limit=warmup_days)
+            if len(warmup_bars) < warmup_days:
+                print(f"    WARNING: Only got {len(warmup_bars)}/{warmup_days} bars")
+            trader.warmup(warmup_bars)
+
+    def daily_step(self) -> dict:
+        """Execute one daily cycle for all active traders.
+
+        Returns dict of {ticker: step_result_or_None}.
+        """
+        results = {}
+        for asset_id, trader in self.traders.items():
+            if asset_id in self._disabled_assets:
+                results[asset_id] = None
+                continue
+
+            result = trader.step()
+            results[asset_id] = result
+
+            if result is not None:
+                print(f"  [{asset_id}] {result['date']} | {result['action_name']:>4} | "
+                      f"${result['portfolio_value']:,.2f} | Trade: {result['trade_executed']}")
+
+                # Check per-asset max drawdown
+                max_dd = self.pt_config.get("risk", {}).get("max_drawdown_per_asset", 0.50)
+                metrics = trader.state_manager.get_metrics()
+                if metrics["max_drawdown"] >= max_dd:
+                    print(f"  WARNING: {asset_id} hit max drawdown ({metrics['max_drawdown']:.1%}), disabling")
+                    self._disabled_assets.add(asset_id)
+
+        return results
+
+    def get_aggregate_stats(self) -> dict:
+        """Combined portfolio statistics across all assets."""
+        total_trades = 0
+        total_value = 0.0
+        total_initial = 0.0
+        per_asset = {}
+
+        for asset_id, trader in self.traders.items():
+            metrics = trader.state_manager.get_metrics()
+            total_trades += metrics["trade_count"]
+            total_value += metrics["final_value"]
+            total_initial += trader.state_manager.initial_cash
+            per_asset[asset_id] = metrics
+
+        combined_return = (total_value / total_initial - 1.0) if total_initial > 0 else 0.0
+
+        return {
+            "total_trades": total_trades,
+            "total_value": total_value,
+            "combined_return": combined_return,
+            "active_assets": len(self.traders) - len(self._disabled_assets),
+            "disabled_assets": list(self._disabled_assets),
+            "per_asset": per_asset,
+        }
+
+    def run_replay(self) -> dict:
+        """Run historical replay for all assets using walk-forward fold_5 test data."""
+        print("\n=== Multi-Asset Paper Trading: Historical Replay ===")
+
+        risk_cfg = self.pt_config.get("risk", {})
+        capital_per_asset = risk_cfg.get("capital_per_asset", 2000)
+        warmup_days = self.default_config.get("live", {}).get("warmup_days", 60)
+
+        for asset_cfg in self.pt_config["assets"]:
+            if not asset_cfg.get("enabled", True):
+                continue
+
+            asset_id = asset_cfg.get("yf_ticker", asset_cfg["ticker"])
+            model_path = asset_cfg["model_path"]
+            train_npz_path = asset_cfg["train_npz_path"]
+
+            # For replay, we need test.npz from the same fold
+            test_npz_path = train_npz_path.replace("train.npz", "test.npz")
+
+            if not os.path.exists(train_npz_path):
+                print(f"  SKIP {asset_id}: {train_npz_path} not found")
+                continue
+            if not os.path.exists(test_npz_path):
+                print(f"  SKIP {asset_id}: {test_npz_path} not found")
+                continue
+
+            model_path_check = model_path if os.path.exists(model_path) else model_path + ".zip"
+            if not os.path.exists(model_path_check) and not os.path.exists(model_path):
+                print(f"  SKIP {asset_id}: model not found at {model_path}")
+                continue
+
+            # Build per-asset config
+            asset_config = dict(self.default_config)
+            asset_config["env"] = dict(self.default_config["env"])
+            asset_config["env"]["initial_cash"] = capital_per_asset
+            asset_config["data"] = dict(self.default_config["data"])
+            asset_config["data"]["binance_symbol"] = asset_cfg["ticker"]
+            asset_config["data"]["asset"] = asset_id
+
+            # Build replay feed from test.npz
+            feed, warmup_bars = self._build_replay_feed(
+                train_npz_path, test_npz_path, warmup_days
+            )
+
+            asset_log_dir = os.path.join(self.log_dir, asset_id)
+            trader = PaperTrader(
+                model_path=model_path,
+                train_npz_path=train_npz_path,
+                config=asset_config,
+                feed=feed,
+                log_dir=asset_log_dir,
+            )
+            trader.warmup(warmup_bars)
+            self.traders[asset_id] = trader
+
+        # Run replay for each asset
+        for asset_id, trader in self.traders.items():
+            print(f"\n--- {asset_id} Replay ---")
+            trader.run_replay()
+
+        # Print combined summary
+        stats = self.get_aggregate_stats()
+        self._print_summary(stats)
+        self._save_summary(stats)
+
+        return stats
+
+    def run_live(self) -> None:
+        """Live paper trading loop: check for new daily bars periodically."""
+        schedule_cfg = self.pt_config.get("schedule", {})
+        check_interval = schedule_cfg.get("check_interval_hours", 1.0)
+        interval_secs = check_interval * 3600
+
+        print(f"\n=== Multi-Asset Paper Trading: Live Mode ===")
+        print(f"  Assets: {list(self.traders.keys())}")
+        print(f"  Check interval: {check_interval}h")
+
+        self.warmup_live()
+
+        try:
+            while True:
+                results = self.daily_step()
+
+                # Check if any new data was processed
+                any_new = any(r is not None for r in results.values())
+                if any_new:
+                    stats = self.get_aggregate_stats()
+                    print(f"  [TOTAL] Trades: {stats['total_trades']} | "
+                          f"Value: ${stats['total_value']:,.2f} | "
+                          f"Return: {stats['combined_return']:.2%}")
+                    self._save_summary(stats)
+                    self._save_states()
+
+                    # Check total drawdown
+                    max_total_dd = self.pt_config.get("risk", {}).get("max_drawdown_total", 0.30)
+                    if stats["combined_return"] < -max_total_dd:
+                        print(f"  EMERGENCY: Total drawdown {stats['combined_return']:.1%} "
+                              f"exceeds limit {-max_total_dd:.1%}. Stopping.")
+                        break
+
+                time.sleep(interval_secs)
+
+        except KeyboardInterrupt:
+            print("\nLive trading stopped by user.")
+            stats = self.get_aggregate_stats()
+            self._print_summary(stats)
+            self._save_summary(stats)
+
+    def _build_replay_feed(
+        self, train_npz_path: str, test_npz_path: str, warmup_days: int
+    ) -> tuple:
+        """Build replay feed and warmup bars from npz files."""
+        import pandas as pd
+
+        train_data = np.load(train_npz_path, allow_pickle=True)
+        test_data = np.load(test_npz_path, allow_pickle=True)
+
+        # Warmup bars from end of train data
+        warmup_bars = []
+        train_closes = train_data["close_prices"]
+        train_dates = train_data["dates"]
+        train_fng = train_data["fng_norm"] * 100
+
+        start = max(0, len(train_closes) - warmup_days)
+        for i in range(start, len(train_closes)):
+            warmup_bars.append({
+                "date": str(train_dates[i]),
+                "open": float(train_closes[i]),
+                "high": float(train_closes[i]),
+                "low": float(train_closes[i]),
+                "close": float(train_closes[i]),
+                "volume": 0.0,
+                "taker_buy_volume": 0.0,
+                "fng": float(train_fng[i]),
+            })
+
+        # Test bars for replay
+        test_closes = test_data["close_prices"]
+        test_dates = test_data["dates"]
+        test_fng = test_data["fng_norm"] * 100
+
+        test_df = pd.DataFrame({
+            "open": test_closes,
+            "high": test_closes,
+            "low": test_closes,
+            "close": test_closes,
+            "volume": np.zeros(len(test_closes)),
+        }, index=pd.to_datetime(test_dates))
+
+        fng_series = pd.Series(test_fng, index=pd.to_datetime(test_dates))
+        feed = HistoricalReplayFeed(test_df, fng_series)
+
+        return feed, warmup_bars
+
+    def _print_summary(self, stats: dict) -> None:
+        """Print multi-asset summary table."""
+        print(f"\n{'=' * 70}")
+        print("  Multi-Asset Paper Trading Summary")
+        print(f"{'=' * 70}")
+        print(f"  {'Asset':<12} {'Return':>10} {'Sharpe':>8} {'MaxDD':>8} {'Trades':>8} {'WinRate':>8}")
+        print(f"  {'-'*12} {'-'*10} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+
+        for asset_id, metrics in stats["per_asset"].items():
+            disabled = " [OFF]" if asset_id in self._disabled_assets else ""
+            print(f"  {asset_id + disabled:<12} "
+                  f"{metrics['cumulative_return']:>9.2%} "
+                  f"{metrics['sharpe_ratio']:>8.3f} "
+                  f"{metrics['max_drawdown']:>8.2%} "
+                  f"{metrics['trade_count']:>8d} "
+                  f"{metrics['win_rate']:>7.1%}")
+
+        print(f"  {'-'*12} {'-'*10} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+        print(f"  {'TOTAL':<12} "
+              f"{stats['combined_return']:>9.2%} "
+              f"{'':>8} "
+              f"{'':>8} "
+              f"{stats['total_trades']:>8d} "
+              f"{'':>8}")
+        print(f"  Portfolio value: ${stats['total_value']:,.2f}")
+        print(f"  Active assets: {stats['active_assets']}")
+        if stats["disabled_assets"]:
+            print(f"  Disabled (max DD): {stats['disabled_assets']}")
+        print(f"{'=' * 70}")
+
+    def _save_summary(self, stats: dict) -> None:
+        """Save summary to JSON."""
+        os.makedirs(self.log_dir, exist_ok=True)
+        path = os.path.join(self.log_dir, "summary.json")
+        with open(path, "w") as f:
+            json.dump(stats, f, indent=2, default=str)
+
+    def _save_states(self) -> None:
+        """Save state for all traders for crash recovery."""
+        os.makedirs(self.state_dir, exist_ok=True)
+        for asset_id, trader in self.traders.items():
+            state_path = os.path.join(self.state_dir, f"{asset_id}.json")
+            trader.save_state(state_path)
+
+    def _write_combined_log(self, results: dict) -> None:
+        """Append daily results to combined CSV log."""
+        os.makedirs(self.log_dir, exist_ok=True)
+        csv_path = os.path.join(self.log_dir, "combined_log.csv")
+        file_exists = os.path.exists(csv_path)
+
+        fieldnames = ["date", "asset", "action", "price", "portfolio_value",
+                       "trade_executed", "cumulative_return"]
+
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            for asset_id, result in results.items():
+                if result is not None:
+                    writer.writerow({
+                        "date": result["date"],
+                        "asset": asset_id,
+                        "action": result["action_name"],
+                        "price": f"{result['price']:.2f}",
+                        "portfolio_value": f"{result['portfolio_value']:.2f}",
+                        "trade_executed": result["trade_executed"],
+                        "cumulative_return": f"{result.get('cumulative_return', 0):.4f}",
+                    })

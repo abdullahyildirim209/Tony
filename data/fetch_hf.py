@@ -1,4 +1,4 @@
-"""HuggingFace data loader: download Binance OHLCV, aggregate to daily bars."""
+"""HuggingFace data loader: query Binance OHLCV via DuckDB, aggregate to daily bars."""
 
 import os
 
@@ -7,75 +7,48 @@ import pandas as pd
 
 
 def load_hf_ohlcv(symbol: str = "BTCUSDT", cache_dir: str = "data/hf_cache") -> pd.DataFrame:
-    """Load 1-min candles from HF dataset, filtered by symbol. Caches to parquet."""
-    from datasets import load_dataset
+    """Load 1-min candles from HF dataset via DuckDB, filtered by symbol. Caches to parquet."""
+    import duckdb
 
     cache_path = os.path.join(cache_dir, f"{symbol}_1min.parquet")
     if os.path.exists(cache_path):
         print(f"  Loading cached 1-min data from {cache_path}")
         return pd.read_parquet(cache_path)
 
-    print(f"  Streaming HF dataset for {symbol} (this may take a while)...")
-    ds = load_dataset(
-        "123olp/binance-futures-ohlcv-2018-2026",
-        streaming=True,
-        split="train",
-    )
+    print(f"  Querying HF dataset for {symbol} via DuckDB (first run may take a few minutes)...")
+    con = duckdb.connect()
+    con.execute("INSTALL httpfs; LOAD httpfs;")
 
-    rows = []
-    count = 0
-    for row in ds:
-        if row.get("symbol") == symbol:
-            rows.append(row)
-            count += 1
-            if count % 500_000 == 0:
-                print(f"    ...loaded {count:,} rows")
+    df = con.execute("""
+        SELECT
+            bucket_ts AS timestamp,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            taker_buy_volume
+        FROM read_csv_auto('hf://datasets/123olp/binance-futures-ohlcv-2018-2026/candles_1m.csv.gz')
+        WHERE symbol = ?
+        ORDER BY bucket_ts
+    """, [symbol]).fetchdf()
+    con.close()
 
-    if not rows:
+    if len(df) == 0:
         raise ValueError(f"No data found for symbol '{symbol}' in HF dataset")
 
-    df = pd.DataFrame(rows)
     print(f"  Total rows for {symbol}: {len(df):,}")
 
-    # Standardize column names (dataset uses: open_time, open, high, low, close, volume, ...)
-    col_map = {}
-    for col in df.columns:
-        lower = col.lower()
-        if lower in ("open_time", "timestamp", "time", "date", "bucket_ts"):
-            col_map[col] = "timestamp"
-        elif lower == "open":
-            col_map[col] = "open"
-        elif lower == "high":
-            col_map[col] = "high"
-        elif lower == "low":
-            col_map[col] = "low"
-        elif lower == "close":
-            col_map[col] = "close"
-        elif lower == "volume":
-            col_map[col] = "volume"
-        elif lower in ("taker_buy_volume", "taker_buy_base_asset_volume"):
-            col_map[col] = "taker_buy_volume"
-    df = df.rename(columns=col_map)
-
-    # Parse timestamp
-    if "timestamp" in df.columns:
-        ts = pd.to_numeric(df["timestamp"], errors="coerce")
-        if ts.notna().any() and ts.median() > 1e12:
-            df["timestamp"] = pd.to_datetime(ts, unit="ms", utc=True)
-        elif ts.notna().any():
-            df["timestamp"] = pd.to_datetime(ts, unit="s", utc=True)
-        else:
-            # String timestamps (e.g. '2020-01-01 00:00:00+00')
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df = df.sort_values("timestamp").reset_index(drop=True)
-
-    # Keep only OHLCV + taker_buy_volume + timestamp
+    # Ensure numeric types
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "taker_buy_volume" in df.columns:
-        df["taker_buy_volume"] = pd.to_numeric(df["taker_buy_volume"], errors="coerce")
-    else:
-        df["taker_buy_volume"] = df["volume"] * 0.5  # neutral fallback
+    df["taker_buy_volume"] = pd.to_numeric(df["taker_buy_volume"], errors="coerce")
+    # Neutral fallback if taker_buy_volume is all null
+    if df["taker_buy_volume"].isna().all():
+        df["taker_buy_volume"] = df["volume"] * 0.5
+
+    # Parse timestamp
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df = df[["timestamp", "open", "high", "low", "close", "volume", "taker_buy_volume"]].dropna()
 
     # Cache

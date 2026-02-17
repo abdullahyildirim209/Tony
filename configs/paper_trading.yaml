@@ -1,0 +1,58 @@
+# Multi-asset paper trading configuration.
+# Each asset runs an independent DQN model trained via walk-forward.
+# Model paths match walk_forward.py output: models/walk_forward/{asset}/fold_5/best_model
+# 8 assets with sufficient HuggingFace data (2020+, 1900+ daily rows each)
+
+assets:
+  - ticker: "BTCUSDT"
+    model_path: "models/walk_forward/BTCUSDT/fold_5/best_model"
+    train_npz_path: "data/walk_forward/BTCUSDT/fold_5/train.npz"
+    enabled: true
+
+  - ticker: "ETHUSDT"
+    model_path: "models/walk_forward/ETHUSDT/fold_5/best_model"
+    train_npz_path: "data/walk_forward/ETHUSDT/fold_5/train.npz"
+    enabled: true
+
+  - ticker: "BNBUSDT"
+    model_path: "models/walk_forward/BNBUSDT/fold_5/best_model"
+    train_npz_path: "data/walk_forward/BNBUSDT/fold_5/train.npz"
+    enabled: true
+
+  - ticker: "ADAUSDT"
+    model_path: "models/walk_forward/ADAUSDT/fold_5/best_model"
+    train_npz_path: "data/walk_forward/ADAUSDT/fold_5/train.npz"
+    enabled: true
+
+  - ticker: "DOGEUSDT"
+    model_path: "models/walk_forward/DOGEUSDT/fold_5/best_model"
+    train_npz_path: "data/walk_forward/DOGEUSDT/fold_5/train.npz"
+    enabled: true
+
+  - ticker: "DOTUSDT"
+    model_path: "models/walk_forward/DOTUSDT/fold_5/best_model"
+    train_npz_path: "data/walk_forward/DOTUSDT/fold_5/train.npz"
+    enabled: true
+
+  - ticker: "AVAXUSDT"
+    model_path: "models/walk_forward/AVAXUSDT/fold_5/best_model"
+    train_npz_path: "data/walk_forward/AVAXUSDT/fold_5/train.npz"
+    enabled: true
+
+  - ticker: "ATOMUSDT"
+    model_path: "models/walk_forward/ATOMUSDT/fold_5/best_model"
+    train_npz_path: "data/walk_forward/ATOMUSDT/fold_5/train.npz"
+    enabled: true
+
+schedule:
+  check_interval_hours: 1.0
+  check_time_utc: "00:05"
+
+risk:
+  max_drawdown_per_asset: 0.50
+  max_drawdown_total: 0.30
+  capital_per_asset: 1250  # $10k total / 8 assets
+
+logging:
+  log_dir: "paper_trading_logs"
+  state_dir: "paper_trading_logs/state"
