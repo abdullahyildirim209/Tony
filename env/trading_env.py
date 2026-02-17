@@ -252,7 +252,7 @@ class TradingEnv(gym.Env):
             reward = float(np.log(portfolio_value / prev_portfolio))
         else:
             reward = 0.0
-        reward -= 0.0005 * float(trade_executed)
+        reward -= 0.0002 * float(trade_executed)
 
         # Termination conditions
         terminated = False
@@ -278,7 +278,7 @@ class TradingEnv(gym.Env):
                 ep_returns = np.diff(values) / values[:-1]
                 ep_returns = ep_returns[np.isfinite(ep_returns)]
                 if len(ep_returns) > 0:
-                    reward += float(np.mean(ep_returns)) / (1.0 - self.gamma)
+                    reward += max(0.0, float(np.mean(ep_returns))) / (1.0 - self.gamma)
 
         info = {
             "portfolio_value": portfolio_value,

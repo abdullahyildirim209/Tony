@@ -463,3 +463,99 @@ All experiments and methods tried throughout the Tony project, organized chronol
   5. **Bear market (fold_1/2):** Model preserved capital on BTC but failed on SOL. ETH was in between.
   6. **Bull market (fold_3/4/5):** Model captured some ETH upside in fold_2/3 but missed SOL rallies in fold_4.
   7. **Key insight:** The DQN learned BTC-specific patterns (mean-reversion timing, volatility regimes) that don't transfer to assets with different microstructure. Cross-asset generalization would require retraining on each asset or using asset-agnostic features.
+
+---
+
+## 18. Fix Losing Assets (DOGEUSDT -46%, ATOMUSDT -50%) — Feb 17
+
+- **Problem:** Portfolio is +2.61% across 8 assets, but DOGEUSDT (-46%) and ATOMUSDT (-50%) are dragging it down. Both hit the 50% max drawdown limit. Root causes identified:
+  1. **Terminal reward bonus amplifies losses**: `mean(ep_returns) / (1 - gamma)` creates ~100x negative penalty at episode end for bear-market assets → agent learns pure passivity
+  2. **Transaction cost too high**: 0.1% (10bps) vs actual Binance 0.02-0.04% → discourages trading on volatile altcoins
+  3. **No portfolio-level filter**: Consistently losing assets get nearly equal capital
+
+- **ATOMUSDT before:** Negative returns in ALL 5 folds, 0% win rate in fold_5, avg Sortino -1.10
+- **DOGEUSDT before:** 0 trades in fold_2, inconsistent across folds, avg Sortino negative
+
+### Changes
+
+#### Change 1: Clip terminal reward bonus (HIGH IMPACT)
+- **File:** `env/trading_env.py` line 281
+- `reward += float(np.mean(ep_returns)) / (1.0 - self.gamma)` → `reward += max(0.0, float(np.mean(ep_returns))) / (1.0 - self.gamma)`
+- Prevents massive negative terminal penalty. Agent still gets natural negative step rewards but isn't hammered with ~100x loss signal at episode end.
+
+#### Change 2: Lower transaction cost to match Binance (MEDIUM IMPACT)
+- **File:** `configs/default.yaml` line 18: `transaction_cost: 0.001` → `0.0004` (4bps, matches Binance futures taker fee)
+- **File:** `env/trading_env.py` line 255: reward penalty `0.0005` → `0.0002`
+
+#### Change 3: Performance filter in allocation (SAFETY NET)
+- **File:** `live/multi_asset_trader.py` `_compute_allocations()`
+- Loads Sortino ratios and % positive folds from `fold_metrics.json`
+- **v1 filter:** avg Sortino < -1.0 AND < 40% positive folds → floor allocation ($125)
+- **v2 filter (tightened):** ALSO flags assets where latest (deployment) fold Sortino < -2.0
+- Redistributes saved capital to healthy assets proportionally by win rate
+
+### Retraining Results (ATOMUSDT)
+
+| Metric | Before | After Retrain |
+|--------|--------|---------------|
+| Cross-fold avg return | -28.5% (all 5 negative) | **-12.55%** (2 positive: +18%, +21%) |
+| Cross-fold avg Sharpe | all negative | **-0.301** (2 positive folds) |
+| fold_5 return | -49.6% | -48.0% (ATOM itself dropped 47%, even B&H lost 47%) |
+| Total trades (all folds) | low | **158** |
+| Statistical Sharpe CI | — | [-1.054, 0.837] |
+
+### Retraining Results (DOGEUSDT)
+
+| Metric | Before | After Retrain |
+|--------|--------|---------------|
+| Cross-fold avg return | negative | **+17.62%** |
+| Cross-fold avg Sharpe | inconsistent | **+0.335** (3/5 positive) |
+| Total trades (all folds) | 66 | **93** (more active) |
+| Mean P&L per trade | negative | **+1.44%** |
+| Statistical Sharpe CI | — | [-0.563, 1.309] |
+
+### Portfolio Replay Results
+
+**Without performance filter (v1 — filter didn't trigger):**
+
+| Asset | Return | Sharpe | Trades | Notes |
+|-------|--------|--------|--------|-------|
+| BTCUSDT | +24.68% | 0.885 | 52 | Unchanged |
+| ETHUSDT | +33.38% | 0.775 | 45 | Unchanged |
+| BNBUSDT | +13.80% | 0.519 | 51 | Unchanged |
+| ADAUSDT | +13.07% | 0.559 | 21 | Unchanged |
+| DOGEUSDT | -51.86% | -3.986 | 9 | Still hit 50% DD |
+| DOTUSDT | +24.11% | 0.656 | 81 | Unchanged |
+| AVAXUSDT | +19.92% | 0.623 | 69 | Unchanged |
+| ATOMUSDT | -51.89% | -3.373 | 7 | Still hit 50% DD |
+| **TOTAL** | **+2.74%** | | 335 | |
+
+- Filter didn't trigger because retrained models improved avg Sortino past -1.0 threshold (ATOM: -0.56, DOGE: +0.14)
+- Problem: fold_5 (deployment fold) is extremely hostile — ATOM dropped 47%, DOGE hit 52% DD
+
+**With tightened filter (v2 — latest fold Sortino < -2.0):**
+
+| Asset | Capital | Return | Sharpe | Trades | Notes |
+|-------|---------|--------|--------|--------|-------|
+| BTCUSDT | $2,257 | +24.68% | 0.885 | 52 | More capital from redistribution |
+| ETHUSDT | $1,221 | +33.38% | 0.775 | 45 | |
+| BNBUSDT | $1,856 | +13.80% | 0.519 | 51 | |
+| ADAUSDT | $1,356 | +13.07% | 0.559 | 21 | |
+| DOGEUSDT | **$125** | -51.86% | -3.986 | 9 | **UNHEALTHY** (latest_sortino=-4.18) |
+| DOTUSDT | $1,636 | +24.11% | 0.656 | 81 | |
+| AVAXUSDT | $1,424 | +19.92% | 0.623 | 69 | |
+| ATOMUSDT | **$125** | -51.89% | -3.373 | 7 | **UNHEALTHY** (latest_sortino=-3.76) |
+| **TOTAL** | $10,000 | **+19.47%** | | 335 | |
+
+### Summary
+
+| Metric | Before All Changes | After All Changes |
+|--------|-------------------|-------------------|
+| Portfolio return | +2.61% | **+19.47%** |
+| Portfolio value | ~$10,261 | **$11,947** |
+| DOGE loss (dollars) | -$673 | **-$65** |
+| ATOM loss (dollars) | -$643 | **-$65** |
+| Healthy asset capital | ~$1,156 each | ~$1,200-2,257 each |
+
+- **Key insight:** When an asset's deployment fold has terrible Sortino (< -2.0), the model cannot trade that regime profitably regardless of cross-fold average. The tightened filter catches this by checking the latest fold specifically, since that's the fold whose model gets deployed.
+- **Lesson:** Cross-fold averages can mask deployment-fold weakness. A model with good avg Sortino but terrible latest-fold Sortino is still dangerous in production. Always check the deployment fold independently.

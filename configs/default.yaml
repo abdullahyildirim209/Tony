@@ -15,7 +15,7 @@ env:
   window_size: 30
   episode_length: 126
   initial_cash: 10000
-  transaction_cost: 0.001
+  transaction_cost: 0.0004  # 4bps, matches Binance futures taker fee
   max_drawdown_threshold: 0.50
   terminal_reward_bonus: true
   random_init: true

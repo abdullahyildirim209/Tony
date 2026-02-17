@@ -104,13 +104,19 @@ The initial implementation drew patterns from these open-source projects:
 
 17. **Trade logging** (`env/trading_env.py`) - Added `trade_log` list to TradingEnv that records entry_price, exit_price, pnl_pct, hold_steps for each completed trade. Used by statistical analysis for per-trade P&L distribution.
 
+18. **Clipped terminal reward bonus** (`env/trading_env.py`) - Terminal bonus now uses `max(0, mean(ep_returns)) / (1 - gamma)` instead of raw mean. Prevents ~100x negative penalty at episode end for bear-market assets that was causing agents to learn pure passivity. Agent still receives natural negative step rewards.
+
+19. **Lower transaction cost** (`configs/default.yaml`, `env/trading_env.py`) - Reduced `transaction_cost` from 0.001 (10bps) to 0.0004 (4bps) to match Binance futures taker fees. Reduced reward trade penalty from 0.0005 to 0.0002 proportionally. Encourages more active trading on volatile altcoins.
+
+20. **Performance filter in allocation** (`live/multi_asset_trader.py`) - Assets with avg Sortino < -1.0 AND < 40% positive folds across walk-forward are flagged "unhealthy" and receive only floor allocation. Saved capital is redistributed to healthy assets proportionally by win rate.
+
 ## Key Architectural Decisions
 
 - **Observation space (38,):** `[30 pct_changes, sma_ratio, rsi_norm, fng_norm, buy_pressure, turbulence, flat_flag, long_flag, unrealized_pnl]`. Window of 30 daily returns gives the agent recent price context without raw price levels (scale-invariant). Turbulence provides explicit regime awareness.
 - **Action space:** Discrete(3) - Buy (all-in), Hold, Sell (all). Invalid actions (e.g., Buy when already long) are treated as Hold.
-- **Reward:** `log(portfolio_value_t / portfolio_value_{t-1}) - 0.001 * trade_executed` + terminal bonus of `mean(episode_returns) / (1 - gamma)` at episode end.
+- **Reward:** `log(portfolio_value_t / portfolio_value_{t-1}) - 0.0002 * trade_executed` + terminal bonus of `max(0, mean(episode_returns)) / (1 - gamma)` at episode end (clipped to non-negative).
 - **Termination:** Max drawdown >= 50% (terminated) or data exhaustion / episode length cap in train (truncated).
 - **Feature clipping:** +-5 std devs using train-only statistics to prevent leakage.
 - **Validation:** 5 episodes averaged, spread across val data, model selected by Sortino ratio.
 - **Ensemble:** PPO, A2C, DQN trained per fold; best by validation Sortino deployed for testing.
-- **Anti-passivity measures:** Terminal reward bonus, random init (30% chance starting long), Sortino selection, multi-algo ensemble (DQN epsilon-greedy), turbulence force-sell.
+- **Anti-passivity measures:** Clipped terminal reward bonus (no negative), random init (30% chance starting long), Sortino selection, multi-algo ensemble (DQN epsilon-greedy), turbulence force-sell, performance-based allocation filter.

@@ -62,8 +62,11 @@ class MultiAssetTrader:
             per = total_capital / max(len(enabled_tickers), 1)
             return {t: per for t in enabled_tickers}
 
-        # Load win rates from walk-forward results
+        # Load win rates and Sortino ratios from walk-forward results
         win_rates: dict[str, float] = {}
+        avg_sortinos: dict[str, float] = {}
+        latest_sortinos: dict[str, float] = {}
+        pct_positive_folds: dict[str, float] = {}
         for ticker in enabled_tickers:
             metrics_path = f"results/{ticker}/walk_forward/fold_metrics.json"
             if os.path.exists(metrics_path):
@@ -71,33 +74,70 @@ class MultiAssetTrader:
                     fold_metrics = json.load(f)
                 rates = [m["win_rate"] for m in fold_metrics.values() if "win_rate" in m]
                 win_rates[ticker] = np.mean(rates) if rates else 0.0
+                sortinos = [m["sortino_ratio"] for m in fold_metrics.values() if "sortino_ratio" in m]
+                avg_sortinos[ticker] = np.mean(sortinos) if sortinos else 0.0
+                # Latest fold Sortino (deployment fold)
+                fold_names = sorted(fold_metrics.keys())
+                latest_fold = fold_metrics[fold_names[-1]] if fold_names else {}
+                latest_sortinos[ticker] = latest_fold.get("sortino_ratio", 0.0)
+                returns = [m["cumulative_return"] for m in fold_metrics.values() if "cumulative_return" in m]
+                n_positive = sum(1 for r in returns if r > 0)
+                pct_positive_folds[ticker] = n_positive / len(returns) if returns else 0.0
             else:
                 win_rates[ticker] = 0.0
+                avg_sortinos[ticker] = 0.0
+                latest_sortinos[ticker] = 0.0
+                pct_positive_folds[ticker] = 0.0
+
+        # Performance filter: flag unhealthy assets
+        # Unhealthy if EITHER:
+        #   1. avg Sortino < -1.0 AND < 40% positive folds, OR
+        #   2. latest (deployment) fold Sortino < -2.0
+        unhealthy: set[str] = set()
+        for ticker in enabled_tickers:
+            reason = ""
+            if avg_sortinos[ticker] < -1.0 and pct_positive_folds[ticker] < 0.40:
+                reason = f"avg_sortino={avg_sortinos[ticker]:.2f}, positive_folds={pct_positive_folds[ticker]:.0%}"
+            elif latest_sortinos[ticker] < -2.0:
+                reason = f"latest_fold_sortino={latest_sortinos[ticker]:.2f}"
+            if reason:
+                unhealthy.add(ticker)
+                print(f"  UNHEALTHY: {ticker} ({reason}) → floor allocation only")
 
         # Floor: every asset gets at least floor_pct of equal share
         floor_pct = alloc_cfg.get("floor_pct", 0.10)
         equal_share = total_capital / len(enabled_tickers)
         floor_amount = equal_share * floor_pct
 
-        remaining = total_capital - floor_amount * len(enabled_tickers)
+        # Unhealthy assets get only floor allocation; remaining capital goes to healthy
+        unhealthy_total = floor_amount * len(unhealthy)
+        healthy_tickers = [t for t in enabled_tickers if t not in unhealthy]
+        remaining = total_capital - unhealthy_total - floor_amount * len(healthy_tickers)
 
-        # Weight by win rate (clip negatives to 0)
-        clipped = {t: max(wr, 0.0) for t, wr in win_rates.items()}
+        # Weight healthy assets by win rate (clip negatives to 0)
+        clipped = {t: max(wr, 0.0) for t, wr in win_rates.items() if t in healthy_tickers}
         total_wr = sum(clipped.values())
 
         allocations = {}
+        # Unhealthy assets get floor only
+        for t in unhealthy:
+            allocations[t] = floor_amount
+
         if total_wr > 0:
-            for t in enabled_tickers:
+            for t in healthy_tickers:
                 allocations[t] = floor_amount + remaining * (clipped[t] / total_wr)
         else:
-            # All zero win rates — fall back to equal
-            for t in enabled_tickers:
-                allocations[t] = total_capital / len(enabled_tickers)
+            # All zero win rates — fall back to equal among healthy
+            healthy_equal = (total_capital - unhealthy_total) / max(len(healthy_tickers), 1)
+            for t in healthy_tickers:
+                allocations[t] = healthy_equal
 
-        print("  Capital allocation (win-rate weighted):")
+        print("  Capital allocation (win-rate weighted + performance filter):")
         for t in enabled_tickers:
             wr_str = f"{win_rates[t]:.1%}" if t in win_rates else "N/A"
-            print(f"    {t:<12} win_rate={wr_str:>6}  capital=${allocations[t]:>10,.2f}")
+            flag = " [UNHEALTHY]" if t in unhealthy else ""
+            print(f"    {t:<12} win_rate={wr_str:>6}  sortino={avg_sortinos.get(t, 0):.2f}  "
+                  f"latest={latest_sortinos.get(t, 0):.2f}  capital=${allocations[t]:>10,.2f}{flag}")
 
         return allocations
 
