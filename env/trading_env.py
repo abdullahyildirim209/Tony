@@ -252,7 +252,7 @@ class TradingEnv(gym.Env):
             reward = float(np.log(portfolio_value / prev_portfolio))
         else:
             reward = 0.0
-        reward -= 0.001 * float(trade_executed)
+        reward -= 0.0005 * float(trade_executed)
 
         # Termination conditions
         terminated = False

@@ -373,7 +373,7 @@ def main(config_path: str = "configs/default.yaml"):
         ensemble_cfg = config.get("ensemble", {})
         ensemble_algos = ensemble_cfg.get("algorithms", [])
 
-        if len(ensemble_algos) > 1:
+        if len(ensemble_algos) >= 1:
             print(f"  Ensemble training ({total_timesteps} timesteps, algos: {ensemble_algos})...")
             model_path, best_algo = train_ensemble(
                 make_train_env=lambda: make_env_from_dict(train_split, config, "train", turb_threshold),

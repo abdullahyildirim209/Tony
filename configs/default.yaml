@@ -59,8 +59,6 @@ validation:
 
 ensemble:
   algorithms:
-    - "ppo"
-    - "a2c"
     - "dqn"
   algorithm_kwargs:
     ppo:
@@ -92,7 +90,7 @@ live:
 
 experiments:
   walk_forward:
-    total_timesteps: 500000
+    total_timesteps: 1500000
     folds:
       - name: "fold_1"
         train_start: "2019-01-01"
