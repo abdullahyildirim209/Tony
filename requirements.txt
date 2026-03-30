@@ -7,4 +7,5 @@ pandas>=2.0.0
 matplotlib>=3.7.0
 pyyaml>=6.0
 datasets>=2.14.0
+duckdb>=1.0.0
 requests>=2.28.0
